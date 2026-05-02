@@ -13,7 +13,8 @@ Training from scratch (no two-stage pre-training required):
   1. Build x_{t_n} and x_{t_{n+1}} from the closed-form OT formula.
   2. Teacher (EMA) predicts velocity at x_{t_{n+1}} → v_{target}.
   3. Student predicts velocity at x_{t_n} → v_{student}.
-  4. Loss: ‖v_{student} − v_{target}‖²
+  4. Add the supervised FM anchor v* = x_clean − μ.
+  5. Loss: ‖v_{student} − v_{target}‖² + λ_FM‖v_{student} − v*‖²
 
 At inference a single network call from x = μ gives:
     x_clean ≈ μ + v_θ(μ, σ_max, cond) · σ_max

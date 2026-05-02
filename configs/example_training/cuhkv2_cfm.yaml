@@ -5,6 +5,7 @@
 #   - batch_size: 1
 #   - check_val_every_n_epoch: 5
 #   - max_epochs: 2000
+#   - loss uses consistency + supervised FM velocity anchor
 ##############################################################################
 
 model:
@@ -68,6 +69,8 @@ model:
       target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
       params:
         loss_type: "l2"
+        consistency_loss_weight: 1.0
+        fm_loss_weight: 1.0         # supervised anchor: v* = x_clean - μ
         num_steps: 18
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization

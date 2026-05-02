@@ -392,6 +392,8 @@ python main.py \
 | `model.params.teacher_ema_decay` | `0.9999` | Teacher EMA 衰减率 |
 | `model.params.loss_fn_config.params.num_steps` | `18` | 训练时 σ 时间表密度，越大覆盖越多噪声水平 |
 | `model.params.loss_fn_config.params.loss_type` | `"l2"` | 速度一致性损失类型，可选 `"l1"` |
+| `model.params.loss_fn_config.params.consistency_loss_weight` | `1.0` | teacher-student 速度一致性损失权重 |
+| `model.params.loss_fn_config.params.fm_loss_weight` | `1.0` | 真实速度锚点损失权重，防止从零训练退化 |
 | `model.params.sampler_config.params.num_steps` | `1` | 推理步数（`1` = 单步；`>1` = Euler 多步） |
 | `lightning.trainer.max_epochs` | `500` | 训练总 epoch 数 |
 | `data.params.batch_size` | `4` | 批大小，根据显存调整 |

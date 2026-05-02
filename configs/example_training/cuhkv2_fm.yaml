@@ -91,29 +91,29 @@ data:
     train:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
+        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
         isTrain: True
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
+        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
         isTrain: False
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
+        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
         isTrain: False
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
+        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
         isTrain: False
 
 lightning:
@@ -146,9 +146,9 @@ lightning:
           return_cond: True
 
   trainer:
-    devices: 2,
+    devices: 0,
     num_sanity_val_steps: 0
     benchmark: True
     accumulate_grad_batches: 1
     check_val_every_n_epoch: 5   # keep cuhkv2 setting
-    max_epochs: 2000
+    max_epochs: 500

@@ -19,6 +19,11 @@ Consistency objective on velocity fields:
 
     L_CFM = ‖ v_θ(x_{t_n}, t_n, μ)  −  v_{θ⁻}(x_{t_{n+1}}, t_{n+1}, μ) ‖²
 
+The supervised FM anchor keeps that self-consistent velocity tied to the true
+OT direction:
+
+    L_FM = ‖ v_θ(x_{t_n}, t_n, μ) − (x_clean − μ) ‖²
+
 where:
   • v_θ       is the student (receives gradients)
   • v_{θ⁻}    is the EMA teacher (stop-gradient, provided via teacher_fn)
@@ -65,6 +70,11 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         loss_type: "l2" (default) or "l1".
         num_steps:  Number of discretisation steps used to build the σ
             schedule from which consecutive pairs (σ_n, σ_{n+1}) are sampled.
+        fm_loss_weight: Weight for the supervised FM anchor term. Keep this
+            greater than 0 when training from scratch; consistency alone can
+            learn a self-consistent but wrong velocity field.
+        consistency_loss_weight: Weight for the teacher-student consistency
+            term.
         batch2model_keys: Keys forwarded from batch to the network.
     """
 
@@ -73,6 +83,8 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         discretization_config: dict,
         loss_type: str = "l2",
         num_steps: int = 18,
+        fm_loss_weight: float = 1.0,
+        consistency_loss_weight: float = 1.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__()
@@ -81,6 +93,8 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.discretization = instantiate_from_config(discretization_config)
         self.loss_type = loss_type
         self.num_steps = num_steps
+        self.fm_loss_weight = fm_loss_weight
+        self.consistency_loss_weight = consistency_loss_weight
 
         if not batch2model_keys:
             batch2model_keys = []
@@ -167,8 +181,19 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             network, x_tn, sigma_n, cond, st_n, **additional_model_inputs
         )
 
-        # ── 5. Consistency loss ────────────────────────────────────────────
-        return self._get_loss(v_student, v_target)
+        # ── 5. Supervised FM anchor: true OT velocity ──────────────────────
+        # Consistency alone only makes the velocity constant along a
+        # trajectory; this term pins that constant to the correct direction.
+        velocity_target = input - mu
+
+        # ── 6. Combined CFM loss ───────────────────────────────────────────
+        consistency_loss = self._get_loss(v_student, v_target)
+        fm_anchor_loss = self._get_loss(v_student, velocity_target)
+
+        return (
+            self.consistency_loss_weight * consistency_loss
+            + self.fm_loss_weight * fm_anchor_loss
+        )
 
     def _get_loss(
         self, pred: torch.Tensor, target: torch.Tensor

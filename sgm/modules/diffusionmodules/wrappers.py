@@ -38,12 +38,13 @@ class CloudRemovalWrapper(IdentityWrapper):
         self, x: torch.Tensor, t: torch.Tensor, c: dict, **kwargs
     ):
         x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=1)
-        if c.get("concat", None) is not None:
-            del c['concat']
+        # Build a new dict without 'concat' so the original cond is never mutated.
+        # (Mutating c in-place breaks callers that reuse the same cond dict.)
+        c_pass = {k: v for k, v in c.items() if k != "concat"}
         return self.diffusion_model(
             x,
             timesteps=t,
-            **c,
+            **c_pass,
             **kwargs,
         )
 
@@ -53,12 +54,11 @@ class TemporalCloudRemovalWrapper(IdentityWrapper):
         self, x: torch.Tensor, t: torch.Tensor, c: dict, return_attn=False, **kwargs
     ):
         x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=2)
-        if c.get("concat", None) is not None:
-            del c['concat']
+        c_pass = {k: v for k, v in c.items() if k != "concat"}
         return self.diffusion_model(
             x,
             timesteps=t,
-            **c,
+            **c_pass,
             return_attn=return_attn,
             **kwargs,
         )

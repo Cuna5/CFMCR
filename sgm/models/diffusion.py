@@ -865,7 +865,9 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
         @torch.no_grad()
         def teacher_fn(x_tn, sigma_n, sigma_n1, st_n, st_n1, _sigma2st, mu, cond, **extra):
             # ── teacher denoises at σ_n ───────────────────────────────
-            denoised_n = denoiser(teacher, x_tn, sigma_n, cond, st_n, **extra)
+            # Pass dict(cond) so CloudRemovalWrapper's `del c['concat']`
+            # does not destroy the shared cond dict for subsequent calls.
+            denoised_n = denoiser(teacher, x_tn, sigma_n, dict(cond), st_n, **extra)
 
             # ── Euler ODE step: x_tn -> x_tn1 ────────────────────────
             st_n_bc        = append_dims(st_n,  x_tn.ndim)
@@ -881,7 +883,7 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
             x_tn1  = (x_tn + d * dt).detach()
 
             # ── teacher denoises at σ_{n-1} (target) ─────────────────
-            f_target = denoiser(teacher, x_tn1, sigma_n1, cond, st_n1, **extra)
+            f_target = denoiser(teacher, x_tn1, sigma_n1, dict(cond), st_n1, **extra)
             return x_tn1, f_target.detach()
 
         return teacher_fn

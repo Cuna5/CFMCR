@@ -356,7 +356,13 @@ EMRDM-ODE/
 
 $$v_\theta(x_{t_n}, t_n, \mu) \approx v_{\theta^-}(x_{t_{n+1}}, t_{n+1}, \mu)$$
 
-其中 $v_{\theta^-}$ 是 EMA teacher 的预测（stop-gradient）。
+其中 $v_{\theta^-}$ 是 EMA teacher 的预测（stop-gradient）。为避免从零训练时 student/teacher 只学到“自洽但错误”的速度场，额外加入 Flow Matching 的真实速度锚点：
+
+$$v^* = x_{clean} - \mu$$
+
+最终损失为：
+
+$$\mathcal{L}_{CFM} = \lambda_c\|v_{student} - v_{target}\|_2^2 + \lambda_{FM}\|v_{student} - (x_{clean}-\mu)\|_2^2$$
 
 **与 CD 和 FM 的核心差异**：
 
@@ -406,7 +412,8 @@ $$s(\sigma) = 1 - \sigma = t, \quad \frac{ds}{d\sigma} = -1$$
 | 3 | **精确**构造下一步：$x_{t_{n+1}} = (1-t_{n+1})\mu + t_{n+1} x_{clean}$（无 ODE 模拟！） |
 | 4 | Teacher（EMA）在 $x_{t_{n+1}}$ 处预测速度 $v_{target}$（**仅 1 次**调用，无梯度） |
 | 5 | Student 在 $x_{t_n}$ 处预测速度 $v_{student}$ |
-| 6 | 损失 $\mathcal{L} = \|v_{student} - v_{target}\|_2^2$ |
+| 6 | 计算真实速度锚点 $v^* = x_{clean} - \mu$ |
+| 7 | 损失 $\mathcal{L} = \lambda_c\|v_{student} - v_{target}\|_2^2 + \lambda_{FM}\|v_{student} - v^*\|_2^2$ |
 
 **构造函数参数**：
 ```python
@@ -414,6 +421,8 @@ ConsistencyFlowMatchingLoss(
     discretization_config,  # 线性 σ 时间表（rho=1）
     loss_type="l2",
     num_steps=18,           # 训练时 σ 对的时间表密度
+    consistency_loss_weight=1.0,
+    fm_loss_weight=1.0,      # 真实速度监督锚点
     batch2model_keys=None,
 )
 ```

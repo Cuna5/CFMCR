@@ -293,14 +293,18 @@ class ConsistencyResidualDiffusionLoss(nn.Module):
         }
 
         # ── 1. Sample a random consecutive (σ_n, σ_{n-1}) pair ────────────
-        # discretization returns [σ_max, …, σ_min, 0]  (num_steps+1 values)
-        sigmas = self.discretization(self.num_steps, device=input.device)
+        # Keep the training pair strictly above σ=0. ResidualEDMScaling uses
+        # log(σ) for the time embedding, so querying the teacher at σ=0 would
+        # produce -inf/NaN. The sampler may still integrate to zero; we just
+        # avoid using zero as a denoiser input during consistency training.
+        sigmas = self.discretization(
+            self.num_steps, device=input.device, do_append_zero=False
+        )
         B = input.shape[0]
-        # Exclude the terminal σ=0 entry so that σ_n > 0
-        valid_len = len(sigmas) - 1          # num_steps indices available
+        valid_len = len(sigmas) - 1          # consecutive pairs above σ=0
         indices = torch.randint(0, valid_len, (B,), device=input.device)
         sigma_n  = sigmas[indices]           # larger σ  (noisier)
-        sigma_n1 = sigmas[indices + 1]       # smaller σ (less noisy / could be 0)
+        sigma_n1 = sigmas[indices + 1]       # smaller σ (less noisy, >= σ_min)
 
         st_n  = sigma2st(sigma_n)
         st_n1 = sigma2st(sigma_n1)
