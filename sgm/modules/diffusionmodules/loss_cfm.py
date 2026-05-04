@@ -2,7 +2,8 @@
 Consistency Flow Matching loss.
 
 Re-exports all FM loss classes and adds:
-  - ConsistencyFlowMatchingLoss: velocity consistency loss on OT straight paths.
+  - ConsistencyFlowMatchingLoss: endpoint and velocity consistency loss on
+    OT straight paths.
 
 Mathematical background
 -----------------------
@@ -15,9 +16,14 @@ Because the OT path is deterministic and x_clean is known during training,
 both interpolation points can be computed directly — NO ODE simulation is
 needed, and the teacher only requires ONE forward pass.
 
-Consistency objective on velocity fields:
+Consistency-FM uses an endpoint map:
 
-    L_CFM = ‖ v_θ(x_{t_n}, t_n, μ)  −  v_{θ⁻}(x_{t_{n+1}}, t_{n+1}, μ) ‖²
+    f_θ(t, x_t, μ) = x_t + (1 − t) · v_θ(x_t, t, μ)
+
+and constrains both endpoint predictions and velocity fields:
+
+    L_end = ‖ f_θ(t_n, x_{t_n}, μ) − f_{θ⁻}(t_{n+1}, x_{t_{n+1}}, μ) ‖²
+    L_vel = ‖ v_θ(x_{t_n}, t_n, μ) − v_{θ⁻}(x_{t_{n+1}}, t_{n+1}, μ) ‖²
 
 The supervised FM anchor keeps that self-consistent velocity tied to the true
 OT direction:
@@ -56,7 +62,7 @@ from .sigma2st import Sigma2St
 
 class ConsistencyFlowMatchingLoss(nn.Module):
     """
-    Velocity consistency loss for Consistency Flow Matching cloud removal.
+    Endpoint and velocity consistency loss for Consistency Flow Matching.
 
     Both training points (x_{t_n} and x_{t_{n+1}}) are constructed from the
     closed-form OT interpolation — no stochastic Euler integration is needed.
@@ -70,11 +76,13 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         loss_type: "l2" (default) or "l1".
         num_steps:  Number of discretisation steps used to build the σ
             schedule from which consecutive pairs (σ_n, σ_{n+1}) are sampled.
+        endpoint_loss_weight: Weight for the endpoint consistency term
+            ||f_θ(t, x_t) - f_{θ⁻}(t+Δt, x_{t+Δt})||².
         fm_loss_weight: Weight for the supervised FM anchor term. Keep this
             greater than 0 when training from scratch; consistency alone can
             learn a self-consistent but wrong velocity field.
-        consistency_loss_weight: Weight for the teacher-student consistency
-            term.
+        consistency_loss_weight: Weight for the teacher-student velocity
+            consistency term.
         batch2model_keys: Keys forwarded from batch to the network.
     """
 
@@ -83,6 +91,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         discretization_config: dict,
         loss_type: str = "l2",
         num_steps: int = 18,
+        endpoint_loss_weight: float = 1.0,
         fm_loss_weight: float = 1.0,
         consistency_loss_weight: float = 1.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
@@ -93,6 +102,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.discretization = instantiate_from_config(discretization_config)
         self.loss_type = loss_type
         self.num_steps = num_steps
+        self.endpoint_loss_weight = endpoint_loss_weight
         self.fm_loss_weight = fm_loss_weight
         self.consistency_loss_weight = consistency_loss_weight
 
@@ -162,6 +172,8 @@ class ConsistencyFlowMatchingLoss(nn.Module):
 
         t_n_bc  = append_dims(t_n,  input.ndim)
         t_n1_bc = append_dims(t_n1, input.ndim)
+        sigma_n_bc = append_dims(sigma_n, input.ndim)
+        sigma_n1_bc = append_dims(sigma_n1, input.ndim)
 
         # ── 2. Construct training points on the OT path (no extra noise) ──
         # x_{t_n}    = (1 − t_n)·μ  + t_n·x_clean   = σ_n·μ + (1−σ_n)·x_clean
@@ -181,17 +193,24 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             network, x_tn, sigma_n, cond, st_n, **additional_model_inputs
         )
 
-        # ── 5. Supervised FM anchor: true OT velocity ──────────────────────
+        # ── 5. Consistency-FM endpoint map f(t, x) = x + (1 - t) v(t, x) ──
+        # Because σ = 1 - t, the remaining time to the endpoint is σ.
+        f_student = x_tn + sigma_n_bc * v_student
+        f_target = x_tn1 + sigma_n1_bc * v_target
+
+        # ── 6. Supervised FM anchor: true OT velocity ──────────────────────
         # Consistency alone only makes the velocity constant along a
         # trajectory; this term pins that constant to the correct direction.
         velocity_target = input - mu
 
-        # ── 6. Combined CFM loss ───────────────────────────────────────────
-        consistency_loss = self._get_loss(v_student, v_target)
+        # ── 7. Combined CFM loss ───────────────────────────────────────────
+        endpoint_loss = self._get_loss(f_student, f_target.detach())
+        velocity_consistency_loss = self._get_loss(v_student, v_target)
         fm_anchor_loss = self._get_loss(v_student, velocity_target)
 
         return (
-            self.consistency_loss_weight * consistency_loss
+            self.endpoint_loss_weight * endpoint_loss
+            + self.consistency_loss_weight * velocity_consistency_loss
             + self.fm_loss_weight * fm_anchor_loss
         )
 

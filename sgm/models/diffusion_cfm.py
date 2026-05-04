@@ -7,17 +7,18 @@ Key idea
 --------
 CFM combines:
   • The straight-line OT paths of Flow Matching  (x_t = (1-t)·μ + t·x_clean)
-  • The velocity self-consistency constraint of Consistency Models
+  • Endpoint and velocity self-consistency constraints from Consistency-FM
 
 Training from scratch (no two-stage pre-training required):
   1. Build x_{t_n} and x_{t_{n+1}} from the closed-form OT formula.
   2. Teacher (EMA) predicts velocity at x_{t_{n+1}} → v_{target}.
   3. Student predicts velocity at x_{t_n} → v_{student}.
-  4. Add the supervised FM anchor v* = x_clean − μ.
-  5. Loss: ‖v_{student} − v_{target}‖² + λ_FM‖v_{student} − v*‖²
+  4. Enforce endpoint consistency on f(t, x) = x + (1 - t) * v(t, x).
+  5. Add velocity consistency and the supervised FM anchor v* = x_clean − μ.
+  6. Loss: endpoint consistency + velocity consistency + λ_FM anchor.
 
 At inference a single network call from x = μ gives:
-    x_clean ≈ μ + v_θ(μ, σ_max, cond) · σ_max
+    x_clean ≈ μ + v_θ(μ, σ_max, cond)
 
 Differences vs. ConsistencyResidualDiffusionEngine
 ---------------------------------------------------
@@ -39,7 +40,6 @@ import copy
 import torch
 
 from .diffusion import ResidualDiffusionEngine
-from ..util import append_dims
 
 
 class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
@@ -90,9 +90,9 @@ class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
             p_t.data.mul_(d).add_(p_s.data, alpha=1.0 - d)
 
     def on_train_batch_end(self, *args, **kwargs):
-        # Update model_ema (validation) then the CFM teacher.
-        super().on_train_batch_end(*args, **kwargs)
+        # Include the CFM teacher update in train_time when timing is enabled.
         self._update_teacher()
+        super().on_train_batch_end(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # Teacher callable
@@ -117,7 +117,7 @@ class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
 
         @torch.no_grad()
         def teacher_fn(x, sigma, st, cond, **extra):
-            v = denoiser(teacher, x, sigma, cond, st, **extra)
+            v = denoiser(teacher, x, sigma, dict(cond), st, **extra)
             return v.detach()
 
         return teacher_fn

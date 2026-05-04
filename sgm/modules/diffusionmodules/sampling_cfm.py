@@ -11,9 +11,9 @@ The CFM consistency model satisfies the self-consistency property over
 velocity fields.  A single call from x = μ (t ≈ 0, σ ≈ 1) suffices:
 
     v = v_θ(μ, σ_max, cond)            # network predicts x_clean − μ
-    x_clean = μ + v · Δt               # Δt = 1 − t_init = σ_max ≈ 1
+    x_clean = μ + v                    # full t=0 → t=1 consistency jump
 
-This is a single Euler step spanning the full time range [t_init, 1].
+This is the single full-range consistency jump used for 1-step inference.
 
 Multi-step inference
 --------------------
@@ -25,8 +25,7 @@ the plain FM Direction 1 sampler, but using CFM-trained weights).
 from .sampling_fm import *      # re-export FlowMatchingResidualSampler, …
 from .sampling_fm import FlowMatchingResidualSampler
 
-import torch
-from ...util import append_dims, default, tools_scale
+from ...util import default, tools_scale
 
 
 class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
@@ -39,7 +38,7 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
     * **1-step** (num_steps = 1):
         x_init = μ  (start from the cloudy image)
         v = v_θ(μ, σ_max, cond)
-        x_clean = μ + v · σ_max           (single Euler step over full range)
+        x_clean = μ + v                  (single full-range consistency step)
 
     * **multi-step** (num_steps > 1):
         Identical to FlowMatchingResidualSampler — Euler ODE from σ_max
@@ -90,9 +89,8 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
         Single-step CFM inference.
 
         Physics:
-            Euler step from t_init = 1 − σ_max  to  t = 1  (full range):
-                x_clean = x_init + v · (1 − t_init)
-                        = μ + v · σ_max
+            Query the model near t=0 and apply the full consistency jump:
+                x_clean = μ + v
         """
         # Use at least 2 discretization points to safely extract σ_max
         n_disc = max(self.num_steps, 2) if self.num_steps is not None else 4
@@ -112,17 +110,14 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
         # Velocity prediction: v_θ(μ, σ_max, cond) ≈ x_clean − μ
         v_pred = self._denoise(x_init, denoiser, sigma, cond, st, uc)
 
-        # 1-step Euler: x_clean = μ + v · σ_max  (Δt = σ_max ≈ 1)
-        sigma_max_bc = append_dims(sigma_max, x_init.ndim)
-        x_clean = x_init + v_pred * sigma_max_bc
+        # 1-step consistency prediction over the full t=0 → t=1 interval.
+        # sigma_max only conditions the network near the start of the path.
+        x_clean = x_init + v_pred
 
         others = {}
         if return_intermediate:
             others["intermediates"] = [tools_scale(x_init.clone().detach())]
         if return_denoised:
-            # x_clean estimate via μ + v  (full-step interpretation)
-            others["denoiseds"] = [
-                tools_scale((mu + v_pred).clone().detach())
-            ]
+            others["denoiseds"] = [tools_scale(x_clean.clone().detach())]
 
         return x_clean, others

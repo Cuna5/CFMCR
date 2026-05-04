@@ -16,6 +16,7 @@ from ..util import (default, disabled_train, get_obj_from_str,
                     instantiate_from_config, log_txt_as_img, tools_scale, tools_scale2, append_dims)
 # from ..modules.learning.metrics import img_metrics, avg_img_metrics
 import os
+import time
 import numpy as np
 from PIL import Image
 import rasterio
@@ -383,28 +384,46 @@ class ResidualDiffusionEngine(DiffusionEngine):
         self.count_sample_time = count_sample_time
         self.count_train_time = count_train_time
         if self.count_train_time:
-            self.train_start_event = None
-            self.train_end_event = None
+            self.train_timer = None
             self.train_time = 0.0
             self.train_count = 0
+
+    def _start_timer(self):
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            with torch.cuda.device(self.device):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+            return ("cuda", start_event, end_event)
+        return ("wall", time.perf_counter())
+
+    def _elapsed_ms(self, timer):
+        if timer[0] == "cuda":
+            _, start_event, end_event = timer
+            with torch.cuda.device(self.device):
+                end_event.record()
+                torch.cuda.synchronize(self.device)
+            return start_event.elapsed_time(end_event)
+        return (time.perf_counter() - timer[1]) * 1000.0
     
     def on_train_batch_start(self, *args, **kwargs):
         super().on_train_batch_start(*args, **kwargs)
         if self.count_train_time:
-            self.train_start_event = torch.cuda.Event(enable_timing=True)
-            self.train_end_event = torch.cuda.Event(enable_timing=True)
-            self.train_start_event.record()
+            self.train_timer = self._start_timer()
     
     def on_train_batch_end(self, *args, **kwargs):
         super().on_train_batch_end(*args, **kwargs)
         if self.count_train_time:
-            self.train_end_event.record()
-            torch.cuda.synchronize()
-            train_time = self.train_start_event.elapsed_time(self.train_end_event)
+            train_time = self._elapsed_ms(self.train_timer)
             self.train_count += 1
             self.train_time += train_time
             avg_train_time = self.train_time / self.train_count
-            self.log_dict({"train_time": avg_train_time}, sync_dist=True, on_step=True, on_epoch=False)
+            self.log_dict(
+                {"train_time": train_time, "train_time_avg": avg_train_time},
+                sync_dist=True,
+                on_step=True,
+                on_epoch=False,
+            )
             # print(f"Train time: {avg_train_time} per batch.")      
     
     def get_input(self, batch, key):
@@ -626,19 +645,21 @@ class ResidualDiffusionEngine(DiffusionEngine):
         z_mu = self.encode_first_stage(mu)
         N = z_mu.shape[0]
         if self.count_sample_time:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
+            sample_timer = self._start_timer()
         with self.ema_scope("Plotting"):
             samples, _ = self.sample(
                 c, z_mu, shape=z_mu.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
             )
             samples = self.decode_first_stage(samples)
         if self.count_sample_time:
-            end_event.record()
-            torch.cuda.synchronize()
-            sample_time = start_event.elapsed_time(end_event)
-            self.log_dict({"sample_time": sample_time}, sync_dist=True, on_step=True, on_epoch=False)
+            sample_time = self._elapsed_ms(sample_timer)
+            self.log_dict(
+                {"sample_time": sample_time},
+                sync_dist=True,
+                on_step=True,
+                on_epoch=True,
+                batch_size=N,
+            )
         
         for i in range(samples.shape[0]):
             _target = target[i,...]
@@ -719,11 +740,14 @@ class ResidualDiffusionEngine(DiffusionEngine):
         sampling_kwargs = {}
         z_mu = self.encode_first_stage(mu)
         N = z_mu.shape[0]
+        if self.count_sample_time:
+            sample_timer = self._start_timer()
         with self.ema_scope("Plotting"):
             samples, _ = self.sample(
                 c, z_mu, shape=z_mu.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
             )
             samples = self.decode_first_stage(samples)
+        sample_time = self._elapsed_ms(sample_timer) if self.count_sample_time else None
 
         path = self.logger.save_dir + "/sample/"
         os.makedirs(path, exist_ok=True)
@@ -750,6 +774,8 @@ class ResidualDiffusionEngine(DiffusionEngine):
         # calculate the metrics
         metrics = self.img_metrics(target=target, pred=samples)
         metrics["image_path"] = image_path
+        if sample_time is not None:
+            metrics["sample_time"] = sample_time
         self.all_pred_metrics.append(metrics)
     
     @torch.no_grad()
@@ -789,19 +815,20 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
         f_θ(x_{σ_n}, σ_n, μ)  ≈  f_{θ^-}(x_{σ_{n-1}}, σ_{n-1}, μ)
 
     where  x_{σ_{n-1}}  is obtained by one Euler ODE step from  x_{σ_n}  using
-    the EMA ("teacher") weights θ^-.  After training, a **single** network call
-    at σ_max recovers the cloud-free image.
+    the frozen pretrained ODE teacher ϕ, and θ^- is the EMA target network.
+    After training, a **single** network call at σ_max recovers the cloud-free
+    image.
 
     Changes vs. ResidualDiffusionEngine
     ------------------------------------
-    * Maintains a *separate* teacher model that is an EMA of the student. This
-      avoids in-place parameter overwrites that would corrupt the student's
-      computation graph during the forward pass.
+    * Maintains a frozen ODE teacher model (ϕ) copied from the pretrained
+      initialization, and a separate EMA target model (θ⁻). This matches the CD
+      split between the solver model and the stop-gradient target network.
     * `forward()` builds a `teacher_fn` closure and passes it to
       `ConsistencyResidualDiffusionLoss`.
     * Expects `loss_fn_config` to target
       ``sgm.modules.diffusionmodules.loss.ConsistencyResidualDiffusionLoss``.
-    * `use_ema` must be True (teacher = EMA model).
+    * `use_ema` must be True for validation/sampling with EMA weights.
     """
 
     def __init__(
@@ -812,14 +839,20 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
     ):
         import copy
 
-        # Force EMA on — the teacher IS the EMA model.
+        # Force EMA on — model_ema is used for validation/sampling.
         kwargs["use_ema"] = True
         super().__init__(*args, **kwargs)
 
         self.teacher_ema_decay = teacher_ema_decay
 
-        # Separate frozen teacher model — never receives gradients.
-        # We keep it in sync with model_ema via manual EMA updates.
+        # Frozen ODE teacher ϕ. If ckpt_path was supplied, this is the
+        # pretrained EMRDM used to take the one-step PF-ODE/Euler move.
+        self.ode_teacher_model = copy.deepcopy(self.model)
+        self.ode_teacher_model.eval()
+        for p in self.ode_teacher_model.parameters():
+            p.requires_grad_(False)
+
+        # EMA target network θ⁻ — never receives gradients.
         self.teacher_model = copy.deepcopy(self.model)
         self.teacher_model.eval()
         for p in self.teacher_model.parameters():
@@ -839,9 +872,9 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
             p_t.data.mul_(d).add_(p_s.data, alpha=1.0 - d)
 
     def on_train_batch_end(self, *args, **kwargs):
-        # Update both model_ema (used for validation) and teacher (used for CD).
-        super().on_train_batch_end(*args, **kwargs)
+        # Include the CD teacher update in train_time when timing is enabled.
         self._update_teacher()
+        super().on_train_batch_end(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # Teacher callable (passed to the loss function)
@@ -849,8 +882,9 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
 
     def _make_teacher_fn(self):
         """
-        Returns a closure that runs *one Euler ODE step* with the teacher
-        weights and then queries the teacher at the next σ level.
+        Returns a closure that runs *one Euler ODE step* with the frozen
+        pretrained ODE teacher ϕ, then queries the EMA target θ⁻ at the next σ
+        level.
 
         Signature expected by ConsistencyResidualDiffusionLoss:
             teacher_fn(x_tn, sigma_n, sigma_n1, st_n, st_n1,
@@ -860,14 +894,17 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
         """
         denoiser = self.denoiser
         teacher  = self.teacher_model
+        ode_teacher = self.ode_teacher_model
         sigma2st = self.sigma2st
 
         @torch.no_grad()
         def teacher_fn(x_tn, sigma_n, sigma_n1, st_n, st_n1, _sigma2st, mu, cond, **extra):
-            # ── teacher denoises at σ_n ───────────────────────────────
-            # Pass dict(cond) so CloudRemovalWrapper's `del c['concat']`
-            # does not destroy the shared cond dict for subsequent calls.
-            denoised_n = denoiser(teacher, x_tn, sigma_n, dict(cond), st_n, **extra)
+            # ── frozen ODE teacher denoises at σ_n ─────────────────────
+            # Pass dict(cond) so wrappers that edit condition dictionaries
+            # cannot affect subsequent student/target calls in this loss.
+            denoised_n = denoiser(
+                ode_teacher, x_tn, sigma_n, dict(cond), st_n, **extra
+            )
 
             # ── Euler ODE step: x_tn -> x_tn1 ────────────────────────
             st_n_bc        = append_dims(st_n,  x_tn.ndim)
@@ -882,7 +919,7 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
             dt     = append_dims(sigma_n1 - sigma_n, x_tn.ndim)
             x_tn1  = (x_tn + d * dt).detach()
 
-            # ── teacher denoises at σ_{n-1} (target) ─────────────────
+            # ── EMA target denoises at σ_{n-1} (stop-gradient target) ──
             f_target = denoiser(teacher, x_tn1, sigma_n1, dict(cond), st_n1, **extra)
             return x_tn1, f_target.detach()
 
@@ -1102,19 +1139,21 @@ class TemporalResidualDiffusionEngine(ResidualDiffusionEngine):
         z_mu = self.encode_first_stage(mu)
         N = z_mu.shape[0]
         if self.count_sample_time:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
+            sample_timer = self._start_timer()
         with self.ema_scope("Plotting"):
             samples, _ = self.sample(
                 c, z_mu, batch, shape=z_mu.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
             )
             samples = self.decode_first_stage(samples)
         if self.count_sample_time:
-            end_event.record()
-            torch.cuda.synchronize()
-            sample_time = start_event.elapsed_time(end_event)
-            self.log_dict({"sample_time": sample_time}, sync_dist=True, on_step=True, on_epoch=False)
+            sample_time = self._elapsed_ms(sample_timer)
+            self.log_dict(
+                {"sample_time": sample_time},
+                sync_dist=True,
+                on_step=True,
+                on_epoch=True,
+                batch_size=N,
+            )
         
         for i in range(samples.shape[0]):
             _target = target[i,...]
@@ -1167,11 +1206,14 @@ class TemporalResidualDiffusionEngine(ResidualDiffusionEngine):
         sampling_kwargs = {}
         z_mu = self.encode_first_stage(mu)
         N = z_mu.shape[0]
+        if self.count_sample_time:
+            sample_timer = self._start_timer()
         with self.ema_scope("Plotting"):
             samples, others = self.sample(
                 c, z_mu, batch, shape=z_mu.shape[1:], uc=uc, batch_size=N, return_attn=True, **sampling_kwargs
             )
             samples = self.decode_first_stage(samples)
+        sample_time = self._elapsed_ms(sample_timer) if self.count_sample_time else None
 
         attns = others["attns"]
         attn = attns[-1]
@@ -1245,6 +1287,8 @@ class TemporalResidualDiffusionEngine(ResidualDiffusionEngine):
         # plt.close()  
         metrics = self.img_metrics(target=target, pred=samples)
         metrics["image_path"] = image_path
+        if sample_time is not None:
+            metrics["sample_time"] = sample_time
         self.all_pred_metrics.append(metrics)
         
     

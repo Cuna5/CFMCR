@@ -10,14 +10,13 @@
 #
 # cuhkv2 专有保留项：
 #   - denoiser_scaling 中的 sigma_cov: 0.9
-#   - loss_weighting   中的 sigma_cov: 0.9
-#   - sigma_sampler p_mean=-1.2 / p_std=1.2
-#   - s_churn=2.5（影响训练期间 sigma 对的采样范围）
-#   - check_val_every_n_epoch: 5
+#   - CUHK-CR2 数据路径、batch_size=1、check_val_every_n_epoch=5
+#   - 原始 loss_weighting / sigma_sampler / s_churn 不再使用；
+#     CD loss 直接从 discretization_config 采样相邻 sigma 对。
 ##############################################################################
 
 model:
-  base_learning_rate: 1.0e-4          # 蒸馏微调使用更小的学习率
+  base_learning_rate: 2.0e-5          # 蒸馏微调使用更小的学习率
   target: sgm.models.diffusion.ConsistencyResidualDiffusionEngine
   params:
     input_key: "label"

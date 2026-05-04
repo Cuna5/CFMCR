@@ -9,13 +9,12 @@
 # self-constraint (same velocity predicted for any t on the same trajectory):
 #
 #   x_t = (1-t)·μ + t·x_clean            (OT path, no extra noise)
-#   Loss: consistency + supervised FM anchor
-#         ‖v_θ(x_{t_n}, t_n) − v_{θ⁻}(x_{t_{n+1}}, t_{n+1})‖²
-#       + ‖v_θ(x_{t_n}, t_n) − (x_clean − μ)‖²
+#   f_θ(t, x_t) = x_t + (1-t)·v_θ(x_t, t)
+#   Loss: endpoint consistency + velocity consistency + supervised FM anchor
 #
 # Training from scratch — no pre-trained checkpoint required.
 # At inference a SINGLE network call recovers the cloud-free image:
-#   x_clean ≈ μ + v_θ(μ, σ_max) · σ_max
+#   x_clean ≈ μ + v_θ(μ, σ_max)
 #
 # Comparison table
 # ----------------
@@ -94,7 +93,8 @@ model:
       target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
       params:
         loss_type: "l2"
-        consistency_loss_weight: 1.0
+        endpoint_loss_weight: 1.0    # endpoint consistency: f=x+(1-t)v
+        consistency_loss_weight: 1.0 # velocity consistency
         fm_loss_weight: 1.0         # supervised anchor: v* = x_clean - μ
         # Number of σ levels used to sample consecutive (σ_n, σ_{n+1}) pairs.
         # More steps → finer pairs, better coverage of the OT path.

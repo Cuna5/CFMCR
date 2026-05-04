@@ -37,6 +37,8 @@ python main.py \
 ckpt_path: "/path/to/emrdm_pretrained.ckpt"
 ```
 
+该 checkpoint 会同时初始化 student 和冻结的 ODE teacher。训练过程中 ODE teacher 保持不变，用来生成 Euler 轨迹点；EMA target network 则跟随 student 更新，用来提供 stop-gradient 一致性目标。
+
 然后启动蒸馏训练：
 
 ```bash
@@ -153,7 +155,7 @@ A: 降低 `base_learning_rate`（尝试 `5e-6`），或增大 `teacher_ema_decay
 A: 可在推理时使用 `ResidualEulerEDMSampler`（2步）配合蒸馏后的权重，往往能在速度与质量间取得更好平衡。
 
 **Q: 如何从零开始（不加载预训练）训练一致性模型？**  
-A: 删除或注释掉 `ckpt_path`，适当增大 `max_epochs`（建议 500+）并降低学习率至 `1e-5`。效果通常不如两阶段方法，但无需预训练模型。
+A: 不建议这样做。当前 CD 实现需要冻结的 ODE teacher 来生成可靠轨迹点；如果不加载预训练 checkpoint，ODE teacher 也是随机模型，蒸馏目标没有意义。若希望从零训练并保持 1 步推理，优先使用 CFM 配置。
 
 ---
 
@@ -236,7 +238,7 @@ FM 使用 Euler 积分，步数越多质量越好，但速度越慢。在命令�
 model.params.sampler_config.params.num_steps=20
 ```
 
-推荐范围：`5`（快速）到 `20`（高质量）。
+推荐范围：`4`（默认/快速）到 `20`（高质量）。
 
 ---
 
@@ -250,7 +252,7 @@ model.params.sampler_config.params.num_steps=20
 | `model.params.loss_fn_config.params.t_min` | `0.001` | 训练时最小时间步（避免退化到 $t=0$） |
 | `model.params.loss_fn_config.params.t_max` | `0.999` | 训练时最大时间步 |
 | `model.params.loss_fn_config.params.loss_type` | `"l2"` | 速度场损失类型，可选 `"l1"` |
-| `model.params.sampler_config.params.num_steps` | `10` | 推理 Euler 步数 |
+| `model.params.sampler_config.params.num_steps` | `4` | 推理 Euler 步数，可按质量需求调大 |
 | `model.params.network_config.params.sigma_max` | `0.999` | 最大噪声水平（对应 $t_{min}$） |
 | `model.params.network_config.params.sigma_min` | `0.001` | 最小噪声水平（对应 $t_{max}$） |
 | `lightning.trainer.max_epochs` | `500` | 训练总 epoch 数 |
@@ -279,7 +281,7 @@ data:
 |------|----------|----------|-----------|----------|
 | 原始 EMRDM | `cuhk.yaml` | 4–5 步 | 否 | 精度高、经过验证 |
 | Consistency Distillation | `cuhk_consistency.yaml` | **1 步** | **是** | 推理极速（~4× 加速） |
-| Flow Matching | `cuhk_fm.yaml` | 5–20 步（可调） | 否 | 训练稳定、收敛快 |
+| Flow Matching | `cuhk_fm.yaml` | 4–20 步（可调） | 否 | 训练稳定、收敛快 |
 
 ---
 
@@ -292,7 +294,7 @@ A: 检查 `t_min`/`t_max` 是否正确（应避免 $t=0$ 或 $t=1$ 的端点）�
 A: 增加推理步数（`num_steps=20`），或尝试使用 Heun 积分（将来可在 `sampling_fm.py` 中扩展 `FlowMatchingResidualSampler`）。
 
 **Q: FM 和 CD 可以结合使用吗？**  
-A: 可以。先用 FM 训练一个基础模型（快速收敛），再以此为 teacher 做一致性蒸馏，得到 1 步 FM 模型。将 `cuhk_consistency.yaml` 的 `ckpt_path` 指向 FM checkpoint 即可。
+A: 不建议直接把 FM checkpoint 填进 `cuhk_consistency.yaml`。FM 模型预测的是速度场，而 CD/EMRDM 配置预测的是 `x_clean`，denoiser scaling 和目标语义不同。若想把 FM 压成 1 步，使用 `cuhk_cfm.yaml` 并用 FM checkpoint warm-start 更合适。
 
 **Q: 如何切换 CUHK-CR2 数据集？**  
 A: 使用 `cuhkv2_fm.yaml` 替换 `cuhk_fm.yaml`，该配置已调整 `batch_size=1` 和 `max_epochs=2000` 以适配多时相场景。
@@ -309,6 +311,7 @@ Consistency Flow Matching（CFM）综合了 FM 的直线 OT 路径和 CD 的一�
 - **从零训练**（无需预训练 checkpoint）
 - **1 步推理**（默认 `num_steps=1`）
 - teacher 仅需 1 次前向（比 CD 更高效）
+- 训练损失包含端点一致性 `f=x+(1-t)v`、速度一致性和 FM 真实速度锚点三部分
 
 | 数据集 | 配置文件 |
 |--------|----------|
@@ -391,7 +394,8 @@ python main.py \
 | `model.base_learning_rate` | `1e-4` | 初始学习率（从零训练可用较大值） |
 | `model.params.teacher_ema_decay` | `0.9999` | Teacher EMA 衰减率 |
 | `model.params.loss_fn_config.params.num_steps` | `18` | 训练时 σ 时间表密度，越大覆盖越多噪声水平 |
-| `model.params.loss_fn_config.params.loss_type` | `"l2"` | 速度一致性损失类型，可选 `"l1"` |
+| `model.params.loss_fn_config.params.loss_type` | `"l2"` | 一致性/锚点损失类型，可选 `"l1"` |
+| `model.params.loss_fn_config.params.endpoint_loss_weight` | `1.0` | 端点一致性损失权重，约束 `f=x+(1-t)v` |
 | `model.params.loss_fn_config.params.consistency_loss_weight` | `1.0` | teacher-student 速度一致性损失权重 |
 | `model.params.loss_fn_config.params.fm_loss_weight` | `1.0` | 真实速度锚点损失权重，防止从零训练退化 |
 | `model.params.sampler_config.params.num_steps` | `1` | 推理步数（`1` = 单步；`>1` = Euler 多步） |
@@ -432,7 +436,7 @@ data:
 A: 取决于数据集。CFM 训练路径更直（无额外噪声），理论上一致性约束更稳定；CD 利用了已收敛的 EMRDM 先验，初期收敛更快。建议两者都尝试。
 
 **Q: CFM 与 FM 的区别是什么？**  
-A: 两者都使用直线 OT 路径，但 FM 需要多步推理（4–10 步），CFM 通过一致性约束实现 1 步推理。代价是需要额外维护一个 EMA teacher 模型。
+A: 两者都使用直线 OT 路径。FM 直接监督速度场，通常需要多步 Euler 推理；CFM 额外约束 `f=x+(1-t)v` 的端点一致性和速度一致性，因此可以 1 步推理。代价是训练时需要维护一个 EMA teacher 模型。
 
 **Q: `num_steps=1` 和 `num_steps=5` 推理结果差多少？**  
 A: 经验上 CFM 1 步已接近多步质量（这是一致性训练的优势），但如遇质量不足可先尝试 `num_steps=3` 作为折中。
@@ -442,13 +446,19 @@ A: 使用 `cuhkv2_cfm.yaml` 替换 `cuhk_cfm.yaml`，该配置已调整 `batch_s
 
 ---
 
----
-
-# 推理性能统计
+# 推理/训练耗时统计
 
 ## 概述
 
-代码内置 `count_sample_time` 和 `count_train_time` 计时机制（CUDA Event 精确计时），可对比各改进方向的推理/训练速度。指标会实时写入 TensorBoard 日志和 `metrics.csv`。
+代码内置 `count_sample_time` 和 `count_train_time` 计时机制，可对比各改进方向的推理/训练速度。CUDA 训练/推理时使用 CUDA Event 统计 GPU 实际执行时间；CPU/MPS 调试时自动回退到 `time.perf_counter()`。
+
+| 开关 | 指标 | 统计范围 |
+|------|------|----------|
+| `count_sample_time=True` | `sample_time` | validation/test/predict 中的 sample + decode 耗时，单位 ms/batch |
+| `count_train_time=True` | `train_time` | 当前训练 batch 耗时，单位 ms/batch |
+| `count_train_time=True` | `train_time_avg` | 当前进程内训练 batch 平均耗时，单位 ms/batch |
+
+`train_time` 从 `on_train_batch_start` 开始计时，不包含 dataloader 取数时间；CD/CFM 的 teacher EMA 更新会被纳入训练耗时。
 
 ---
 
@@ -474,6 +484,16 @@ python main.py \
     model.params.count_sample_time=True
 ```
 
+训练时统计 batch 耗时：
+
+```bash
+python main.py \
+    --base configs/example_training/cuhk_cfm.yaml \
+    --train \
+    --devices 0, \
+    model.params.count_train_time=True
+```
+
 ---
 
 ## 查看结果
@@ -484,13 +504,19 @@ python main.py \
 tensorboard --logdir logs/
 ```
 
-在 Scalars 面板中查看 `sample_time`（每 step 的推理耗时，单位毫秒）和 `train_time`（每 step 的训练耗时）。
+在 Scalars 面板中查看：
+
+- `sample_time`：每个 validation/test step 的推理耗时
+- `train_time`：当前训练 batch 耗时
+- `train_time_avg`：训练 batch 运行均值
 
 ### CSV 日志
 
 ```bash
 grep "sample_time" logs/<experiment>/metrics.csv
 ```
+
+`--predict` 会把每张图像的 `sample_time` 写入 `metrics.csv`；validation/test 的 `sample_time` 写入 Lightning logger。
 
 ---
 
@@ -507,7 +533,7 @@ python main.py --base configs/example_training/cuhk.yaml --test \
 python main.py --base configs/example_training/cuhk_consistency.yaml --test \
     --devices 0, model.params.ckpt_path="..." model.params.count_sample_time=True
 
-# Flow Matching（10步）
+# Flow Matching（4步，默认）
 python main.py --base configs/example_training/cuhk_fm.yaml --test \
     --devices 0, model.params.ckpt_path="..." model.params.count_sample_time=True
 
@@ -522,14 +548,14 @@ python main.py --base configs/example_training/cuhk_cfm.yaml --test \
 |------|----------|-------------|
 | 原始 EMRDM | 4 步 | 1× （基线） |
 | CD | **1 步** | ~25% |
-| FM (10步) | 10 步 | ~250% |
+| FM (4步) | 4 步 | ~100% |
 | CFM | **1 步** | ~25% |
 
 ---
 
 ## 对比训练效率
 
-开启 `count_train_time=True` 后，`train_time`（ms/batch）写入日志，可用于验证 CFM 的 teacher 计算量是否比 CD 更低：
+开启 `count_train_time=True` 后，`train_time` 和 `train_time_avg` 会写入日志，可用于验证 CFM 的 teacher 计算量是否比 CD 更低：
 
 - CD teacher：EMRDM Euler 步骤 + **2 次** teacher 前向
 - CFM teacher：OT 公式直接计算 + **1 次** teacher 前向

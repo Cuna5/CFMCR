@@ -13,11 +13,11 @@
 $$f_\theta(x_{\sigma_n}, \sigma_n, \mu) \approx f_{\theta^-}(x_{\sigma_{n-1}}, \sigma_{n-1}, \mu)$$
 
 其中：
-- $x_{\sigma_{n-1}}$ 由 **teacher 模型**（student 的 EMA）对 $x_{\sigma_n}$ 做一步 Euler ODE 积分得到
-- $f_{\theta^-}$ 为 stop-gradient 的 EMA teacher 预测（目标），不参与反向传播
+- $x_{\sigma_{n-1}}$ 由冻结的 **ODE teacher** $\phi$（从预训练 EMRDM checkpoint 复制）对 $x_{\sigma_n}$ 做一步 Euler ODE 积分得到
+- $f_{\theta^-}$ 为 stop-gradient 的 EMA target network 预测（目标），不参与反向传播
 - $f_\theta$ 为 student 预测，接收梯度更新
 
-**训练时**：随机采样连续噪声对 $(\sigma_n, \sigma_{n-1})$，用 teacher ODE 步骤生成目标，最小化 student/teacher 预测间的 L2 距离。  
+**训练时**：随机采样连续噪声对 $(\sigma_n, \sigma_{n-1})$，用冻结的预训练 ODE teacher 生成下一轨迹点，再用 EMA target network 生成一致性目标，最小化 student/target 预测间的 L2 距离。
 **推理时**：仅调用一次 $f_\theta(x_{\sigma_{\max}}, \sigma_{\max}, \mu)$ 直接得到无云图像。
 
 ---
@@ -72,10 +72,10 @@ ConsistencyResidualDiffusionLoss(
 
 | 方法 | 说明 |
 |------|------|
-| `__init__` | 额外创建 `self.teacher_model`（student 深拷贝，参数全部冻结，不进入优化器） |
+| `__init__` | 额外创建冻结的 `self.ode_teacher_model`（预训练 ODE 求解器）和 `self.teacher_model`（EMA target network） |
 | `_update_teacher()` | EMA 更新 teacher：$\theta^- \leftarrow d \cdot \theta^- + (1-d) \cdot \theta$，默认衰减率 $d=0.9999$ |
 | `on_train_batch_end()` | 在父类 EMA 更新后额外调用 `_update_teacher()` |
-| `_make_teacher_fn()` | 返回 `@torch.no_grad()` 闭包，执行 Euler ODE 步骤后返回 $(x_{\sigma_{n-1}}, f_{target})$ |
+| `_make_teacher_fn()` | 返回 `@torch.no_grad()` 闭包：先用 frozen ODE teacher 执行 Euler ODE 步骤，再用 EMA target network 返回 $(x_{\sigma_{n-1}}, f_{target})$ |
 | `forward()` | 构造 `teacher_fn` 并传给 `ConsistencyResidualDiffusionLoss` |
 
 **构造函数新增参数**：
@@ -86,7 +86,7 @@ ConsistencyResidualDiffusionEngine(
 )
 ```
 
-> **注意**：`use_ema` 被强制设为 `True`（验证/采样时使用 model_ema 权重）。
+> **注意**：`use_ema` 被强制设为 `True`（验证/采样时使用 model_ema 权重）。CD 训练应加载预训练 EMRDM checkpoint；否则 frozen ODE teacher 只是随机初始化，蒸馏目标没有可靠意义。
 
 ---
 
@@ -286,7 +286,7 @@ Flow Matching 在 CUHK-CR1 数据集上的训练配置：
 | `sigma_max` | `0.999` | 对应 t_min ≈ 0.001 |
 | `sigma_min` | `0.001` | 对应 t_max ≈ 0.999 |
 | `rho` | `1` | EDMDiscretization 的 rho=1 → 线性 σ 时间表 |
-| `num_steps` | `10` | Euler 积分步数（可调） |
+| `num_steps` | `4` | Euler 积分步数（可按质量需求调大） |
 
 ---
 
@@ -299,7 +299,7 @@ Flow Matching 在 CUHK-CR1 数据集上的训练配置：
 | `batch_size` | `1` |
 | `check_val_every_n_epoch` | `5` |
 | `max_epochs` | `2000` |
-| `data.target` | `CUHKv2Dataset` |
+| `data.target` | `sgm.data.cuhk.image_datasets.TrainDataset`（路径切到 CUHK-CR2） |
 
 ---
 
@@ -320,7 +320,7 @@ EMRDM-ODE/
         └── cuhkv2_fm.yaml                 ← 新建训练配置（多时相）
 ```
 
-> 以上文件均为**全新增加**，未修改任何已有文件。
+> 以上 FM 文件为新增实现，仍与原 EMRDM 主流程解耦。
 
 ---
 
@@ -340,19 +340,27 @@ EMRDM-ODE/
 
 ---
 
-# 改进记录 — Consistency Flow Matching（一步速度一致性去云）
+# 改进记录 — Consistency Flow Matching（一步端点/速度一致性去云）
 
 ## 改进目标
 
-综合 *Consistency Models*（Song et al., ICML 2023）与 *Flow Matching*（Lipman et al., 2022）的核心思想，在 EMRDM 框架上实现 **Consistency Flow Matching（CFM）**：在直线 OT 路径上施加速度自一致性约束，**从零训练**即可实现 **1 步去云**。
+综合 *Consistency Models*（Song et al., ICML 2023）与 *Flow Matching*（Lipman et al., 2022）的核心思想，在 EMRDM 框架上实现 **Consistency Flow Matching（CFM）**：在直线 OT 路径上施加端点一致性和速度自一致性约束，**从零训练**即可实现 **1 步去云**。
 
-> **实现策略**：所有新代码均以独立新文件形式提供（`*_cfm.py`、`diffusion_cfm.py`），**不修改**任何已有文件。
+> **实现策略**：CFM 初版以独立新文件形式提供（`*_cfm.py`、`diffusion_cfm.py`）。本次校正直接更新这些 CFM 文件与配置，使实现更贴近论文公式。
 
 ---
 
 ## 核心思路
 
-**CFM 的核心约束**：对于同一 OT 轨迹上的任意两个时刻 $t_n < t_{n+1}$，网络预测的速度场应保持一致：
+**CFM 的核心约束**：对于同一 OT 轨迹上的任意两个时刻 $t_n < t_{n+1}$，不仅要求速度场一致，还要求由速度外推到终点的预测一致：
+
+$$f_\theta(t, x_t, \mu) = x_t + (1-t)\,v_\theta(x_t,t,\mu)$$
+
+端点一致性：
+
+$$f_\theta(t_n,x_{t_n},\mu) \approx f_{\theta^-}(t_{n+1},x_{t_{n+1}},\mu)$$
+
+速度一致性：
 
 $$v_\theta(x_{t_n}, t_n, \mu) \approx v_{\theta^-}(x_{t_{n+1}}, t_{n+1}, \mu)$$
 
@@ -362,14 +370,17 @@ $$v^* = x_{clean} - \mu$$
 
 最终损失为：
 
-$$\mathcal{L}_{CFM} = \lambda_c\|v_{student} - v_{target}\|_2^2 + \lambda_{FM}\|v_{student} - (x_{clean}-\mu)\|_2^2$$
+$$\mathcal{L}_{CFM} =
+\lambda_f\|f_{student}-f_{target}\|_2^2
++ \lambda_v\|v_{student} - v_{target}\|_2^2
++ \lambda_{FM}\|v_{student} - (x_{clean}-\mu)\|_2^2$$
 
 **与 CD 和 FM 的核心差异**：
 
 | | Flow Matching (Dir 1) | CD (Dir 2) | **CFM (Dir 3)** |
 |---|---|---|---|
 | 训练点 $x_{t_n}$ | 确定性 OT 公式 | EMRDM 随机噪声路径 | **确定性 OT 公式** |
-| 一致性目标 | 无 | $x_{clean}$（图像空间） | **速度场 $v$（向量场）** |
+| 一致性目标 | 无 | $x_{clean}$（图像空间） | **端点 $f$ + 速度场 $v$** |
 | teacher 计算量 | 无 | ODE 步骤 + 2次 teacher 调用 | **1次 teacher 调用** |
 | 1 步推理 | ✗（需多步） | ✓ | **✓** |
 | 需预训练 | ✗ | ✓ | **✗** |
@@ -412,8 +423,9 @@ $$s(\sigma) = 1 - \sigma = t, \quad \frac{ds}{d\sigma} = -1$$
 | 3 | **精确**构造下一步：$x_{t_{n+1}} = (1-t_{n+1})\mu + t_{n+1} x_{clean}$（无 ODE 模拟！） |
 | 4 | Teacher（EMA）在 $x_{t_{n+1}}$ 处预测速度 $v_{target}$（**仅 1 次**调用，无梯度） |
 | 5 | Student 在 $x_{t_n}$ 处预测速度 $v_{student}$ |
-| 6 | 计算真实速度锚点 $v^* = x_{clean} - \mu$ |
-| 7 | 损失 $\mathcal{L} = \lambda_c\|v_{student} - v_{target}\|_2^2 + \lambda_{FM}\|v_{student} - v^*\|_2^2$ |
+| 6 | 构造端点预测：$f_{student}=x_{t_n}+(1-t_n)v_{student}$，$f_{target}=x_{t_{n+1}}+(1-t_{n+1})v_{target}$ |
+| 7 | 计算真实速度锚点 $v^* = x_{clean} - \mu$ |
+| 8 | 损失 $\mathcal{L} = \lambda_f\|f_{student}-f_{target}\|_2^2 + \lambda_v\|v_{student} - v_{target}\|_2^2 + \lambda_{FM}\|v_{student} - v^*\|_2^2$ |
 
 **构造函数参数**：
 ```python
@@ -421,7 +433,8 @@ ConsistencyFlowMatchingLoss(
     discretization_config,  # 线性 σ 时间表（rho=1）
     loss_type="l2",
     num_steps=18,           # 训练时 σ 对的时间表密度
-    consistency_loss_weight=1.0,
+    endpoint_loss_weight=1.0,
+    consistency_loss_weight=1.0,  # 速度一致性
     fm_loss_weight=1.0,      # 真实速度监督锚点
     batch2model_keys=None,
 )
@@ -440,9 +453,9 @@ forward(self, network, teacher_fn, denoiser, conditioner, sigma2st, input, mu, b
 
 **1 步推理**（`num_steps=1`）：
 
-$$x_{init} = \mu, \quad v = v_\theta(\mu, \sigma_{\max}, \text{cond}), \quad x_{clean} = \mu + v \cdot \sigma_{\max}$$
+$$x_{init} = \mu, \quad v = v_\theta(\mu, \sigma_{\max}, \text{cond}), \quad x_{clean} = \mu + v$$
 
-（对应从 $t_{init} = 1 - \sigma_{\max} \approx 0$ 到 $t=1$ 的单次 Euler 积分）
+这里 $\sigma_{\max}$ 仅用于给网络提供接近 $t=0$ 的时间条件；输出端采用完整的 $t=0 \rightarrow t=1$ 一步一致性跳转，避免因为 $\sigma_{\max}=0.999$ 而少走最后的 $0.1\%$ 路径。
 
 **多步推理**（`num_steps>1`）：自动委托父类 `FlowMatchingResidualSampler` 的 Euler 循环。
 
@@ -487,7 +500,8 @@ CFM 在 CUHK-CR1 上的训练配置：
 | `teacher_ema_decay` | `0.9999` | EMA teacher 衰减率 |
 | `sigma_st_config.target` | `ConsistencyFlowMatchingSigma2St` | s(σ) = 1-σ |
 | `denoiser_scaling_config.target` | `ConsistencyFlowMatchingScaling` | c_skip=0，速度预测 |
-| `loss_fn_config.target` | `ConsistencyFlowMatchingLoss` | CFM 速度一致性损失 |
+| `loss_fn_config.target` | `ConsistencyFlowMatchingLoss` | CFM 端点 + 速度一致性损失 |
+| `loss_fn_config.params.endpoint_loss_weight` | `1.0` | 端点一致性损失权重 |
 | `loss_fn_config.params.num_steps` | `18` | σ 时间表密度 |
 | `sampler_config.target` | `ConsistencyFlowMatchingSampler` | 1 步采样 |
 | `sampler_config.params.num_steps` | `1` | 推理仅 1 步 |
@@ -527,7 +541,7 @@ EMRDM-ODE/
         └── cuhkv2_cfm.yaml                ← 新建训练配置（多时相）
 ```
 
-> 以上文件均为**全新增加**，未修改任何已有文件。
+> 这些是 CFM 初版新增文件；本次校正已在 `loss_cfm.py`、`sampling_cfm.py`、`diffusion_cfm.py` 与 CFM YAML 中补齐论文对应的端点一致性和一步推理端点处理。
 
 ---
 
@@ -543,3 +557,23 @@ EMRDM-ODE/
 | teacher 计算量 | 无 | 2 次调用 + ODE | 无 | **1 次调用** |
 | 训练复杂度 | 基础 | 中等 | 简单 | **中等** |
 | 主要优势 | 精度高 | 推理最快 | 收敛稳定 | **1步+无需预训练** |
+
+---
+
+# 运行耗时统计补充
+
+## 改进目标
+
+为方便比较 EMRDM、CD、FM、CFM 的实际效率，在 `ResidualDiffusionEngine` 中加入可选计时开关：
+
+| 参数 | 记录指标 | 说明 |
+|------|----------|------|
+| `count_sample_time=True` | `sample_time` | 推理耗时，覆盖 validation/test/predict 的 sample + decode 阶段 |
+| `count_train_time=True` | `train_time`、`train_time_avg` | 训练 batch 耗时和运行均值，不包含 dataloader 取数时间 |
+
+## 实现思路
+
+- CUDA 环境使用 `torch.cuda.Event`，保证 GPU 异步执行完成后再统计。
+- 非 CUDA 环境自动回退到 `time.perf_counter()`，避免 CPU/MPS 调试时报错。
+- `--test` / validation 中的 `sample_time` 同步写入 Lightning logger；`--predict` 中的 `sample_time` 写入 `metrics.csv`。
+- CD/CFM 子类的 teacher EMA 更新被纳入 `train_time`，因此训练耗时更接近完整 batch 成本。
