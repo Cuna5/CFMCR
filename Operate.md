@@ -127,13 +127,14 @@ data:
 
 ## 多时相（Sen2_MTC）扩展
 
-如需对多时相数据集进行一致性蒸馏，参照 `cuhk_consistency.yaml` 的改动方式修改 `sen2_mtc_new.yaml`：
+> **当前状态**：`ConsistencyResidualDiffusionEngine` 继承自单时相的 `ResidualDiffusionEngine`，**无法**直接用于多时相数据。把 `model.target` 换成 CD/CFM engine 会在 5D 时序张量上报错（`shared_step` / `sample` / `log_images` 签名都不同）。
 
-1. 将 `model.target` 改为 `ConsistencyResidualDiffusionEngine`
-2. 将 `loss_fn_config.target` 改为 `ConsistencyResidualDiffusionLoss`
-3. 将 `sampler_config.target` 改为 `ConsistencyResidualSampler`
+若需对多时相数据集做一致性蒸馏或 CFM 训练，需要新增专门的 `TemporalConsistencyFlowMatchingEngine` 或 `TemporalConsistencyResidualDiffusionEngine`，继承 `TemporalResidualDiffusionEngine` 并重写：
+1. `shared_step`：处理时序维度的 unsqueeze/repeat；
+2. `sample`：沿用 `TemporalResidualEDMSampler` 或为 FM/CFM 写时序版采样器；
+3. `forward`：注入 `teacher_fn`（多时相 teacher 调用需处理 attention 返回）。
 
-> **注意**：多时相 engine 当前为 `TemporalResidualDiffusionEngine`，继承链与 `ResidualDiffusionEngine` 相同，`ConsistencyResidualDiffusionEngine` 可直接替换使用。
+目前该支持未实装，属于后续扩展工作。单时相 CUHK-CR1 的 CD/CFM 配置（见 `cuhk_consistency.yaml` / `cuhk_cfm.yaml`）不受影响。
 
 ---
 
@@ -398,7 +399,9 @@ python main.py \
 | `model.params.loss_fn_config.params.endpoint_loss_weight` | `1.0` | 端点一致性损失权重，约束 `f=x+(1-t)v` |
 | `model.params.loss_fn_config.params.consistency_loss_weight` | `1.0` | teacher-student 速度一致性损失权重 |
 | `model.params.loss_fn_config.params.fm_loss_weight` | `1.0` | 真实速度锚点损失权重，防止从零训练退化 |
+| `model.params.loss_fn_config.params.consistency_warmup_steps` | `2000` | 端点/速度一致性损失线性 warmup 步数（两阶段训练，Yang 2024） |
 | `model.params.sampler_config.params.num_steps` | `1` | 推理步数（`1` = 单步；`>1` = Euler 多步） |
+| `model.params.scheduler_config` | `LambdaWarmUpCosineScheduler` | LR warmup 2000 步→cosine 衰减 |
 | `lightning.trainer.max_epochs` | `500` | 训练总 epoch 数 |
 | `data.params.batch_size` | `4` | 批大小，根据显存调整 |
 

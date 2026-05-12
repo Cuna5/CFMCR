@@ -76,8 +76,17 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0
             rho: 1          # linear σ schedule
+
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        warm_up_steps: 2000
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.01
+        max_decay_steps: 400000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb

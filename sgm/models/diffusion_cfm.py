@@ -31,8 +31,8 @@ Requires in YAML config:
     model.target: sgm.models.diffusion_cfm.ConsistencyFlowMatchingEngine
     loss_fn_config.target: …loss_cfm.ConsistencyFlowMatchingLoss
     sampler_config.target: …sampling_cfm.ConsistencyFlowMatchingSampler
-    denoiser_scaling_config.target: …denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
-    sigma_st_config.target: …sigma2st_cfm.ConsistencyFlowMatchingSigma2St
+    denoiser_scaling_config.target: …denoiser_scaling_fm.FlowMatchingScaling
+    sigma_st_config.target: …sigma2st_fm.FlowMatchingSigma2St
 """
 
 import copy
@@ -117,7 +117,11 @@ class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
 
         @torch.no_grad()
         def teacher_fn(x, sigma, st, cond, **extra):
-            v = denoiser(teacher, x, sigma, dict(cond), st, **extra)
+            # Shallow-copy the cond dict so wrappers that mutate it cannot
+            # leak into the student forward pass. Inner tensors are shared
+            # but not modified in-place anywhere in the current codebase.
+            cond_copy = {k: v for k, v in cond.items()}
+            v = denoiser(teacher, x, sigma, cond_copy, st, **extra)
             return v.detach()
 
         return teacher_fn

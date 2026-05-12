@@ -154,8 +154,11 @@ class ResidualDiffusionLoss(StandardDiffusionLoss):
             )
         sigmas_bc = append_dims(sigmas, input.ndim)
         st_bc = append_dims(st, input.ndim)
-        mu *= ((1.0 - st_bc) / st_bc)
-        noised_input = self.get_noised_input(sigmas_bc, noise, input, mu)
+        # Avoid in-place modification of the caller's `mu` — the engine passes
+        # the shared batch tensor and an in-place write would leak to anyone
+        # reading `mu` later (e.g. logging or custom loss subclasses).
+        mu_shifted = mu * ((1.0 - st_bc) / st_bc)
+        noised_input = self.get_noised_input(sigmas_bc, noise, input, mu_shifted)
 
         model_output = denoiser(
             network, noised_input, sigmas, cond, st, **additional_model_inputs
@@ -197,8 +200,9 @@ class TemporalResidualDiffusionLoss(ResidualDiffusionLoss):
         # input = input.unsqueeze(dim=1).repeat(1,mu.shape[1],1,1,1)
         sigmas_bc = append_dims(sigmas, input.ndim)
         st_bc = append_dims(st, input.ndim)
-        mu *= ((1.0 - st_bc) / st_bc)
-        noised_input = self.get_noised_input(sigmas_bc, noise, input, mu)
+        # Out-of-place mean-shift — do not clobber the caller's `mu`.
+        mu_shifted = mu * ((1.0 - st_bc) / st_bc)
+        noised_input = self.get_noised_input(sigmas_bc, noise, input, mu_shifted)
         # skip_index = self.get_skip_index(batch)
         model_output = denoiser(
             network, noised_input, sigmas, cond, st, **additional_model_inputs

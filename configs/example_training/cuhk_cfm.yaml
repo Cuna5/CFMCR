@@ -44,14 +44,14 @@ model:
     # ckpt_path: "/path/to/fm_pretrained.ckpt"
 
     sigma_st_config:
-      target: sgm.modules.diffusionmodules.sigma2st_cfm.ConsistencyFlowMatchingSigma2St
+      target: sgm.modules.diffusionmodules.sigma2st_fm.FlowMatchingSigma2St
       # s(σ) = 1 − σ = t  (no extra params)
 
     denoiser_config:
       target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
       params:
         scaling_config:
-          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
+          target: sgm.modules.diffusionmodules.denoiser_scaling_fm.FlowMatchingScaling
           # c_skip=0, c_out=1, c_in=1  — raw network output IS the velocity
 
     network_wrapper: "sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper"
@@ -96,6 +96,11 @@ model:
         endpoint_loss_weight: 1.0    # endpoint consistency: f=x+(1-t)v
         consistency_loss_weight: 1.0 # velocity consistency
         fm_loss_weight: 1.0         # supervised anchor: v* = x_clean - μ
+        # Two-stage training (Yang et al. 2024, Sec. 4.2): the endpoint /
+        # velocity consistency terms are linearly ramped up from 0 over the
+        # first `consistency_warmup_steps` updates so the student + teacher
+        # first learn a correct velocity from the supervised FM anchor.
+        consistency_warmup_steps: 2000
         # Number of σ levels used to sample consecutive (σ_n, σ_{n+1}) pairs.
         # More steps → finer pairs, better coverage of the OT path.
         num_steps: 18
@@ -103,7 +108,7 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0   # σ=1 matches t=0 (start from μ); scaling clamps log
             rho: 1       # linear σ schedule  ↔  uniform t training
 
     # ── 1-step CFM sampler for validation / inference ─────────────────────
@@ -116,8 +121,19 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0
             rho: 1
+
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        # Multipliers applied on top of base_learning_rate (1e-4).
+        # Warmup 0.01→1.0 over 2000 steps, then cosine decay to 0.01.
+        warm_up_steps: 2000
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.01
+        max_decay_steps: 100000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb

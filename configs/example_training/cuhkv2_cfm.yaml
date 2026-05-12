@@ -23,13 +23,13 @@ model:
     # ckpt_path: "/path/to/cuhkv2_pretrained.ckpt"
 
     sigma_st_config:
-      target: sgm.modules.diffusionmodules.sigma2st_cfm.ConsistencyFlowMatchingSigma2St
+      target: sgm.modules.diffusionmodules.sigma2st_fm.FlowMatchingSigma2St
 
     denoiser_config:
       target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
       params:
         scaling_config:
-          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
+          target: sgm.modules.diffusionmodules.denoiser_scaling_fm.FlowMatchingScaling
 
     network_wrapper: "sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper"
 
@@ -72,12 +72,15 @@ model:
         endpoint_loss_weight: 1.0    # endpoint consistency: f=x+(1-t)v
         consistency_loss_weight: 1.0 # velocity consistency
         fm_loss_weight: 1.0         # supervised anchor: v* = x_clean - μ
+        # Two-stage warmup: disable consistency terms for the first N steps
+        # so the teacher can stabilise on the supervised FM anchor alone.
+        consistency_warmup_steps: 2000
         num_steps: 18
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0   # σ=1 matches t=0; FlowMatchingScaling clamps log
             rho: 1
 
     sampler_config:
@@ -88,8 +91,18 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0
             rho: 1
+
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        # Multipliers on top of base_learning_rate.
+        warm_up_steps: 2000
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.01
+        max_decay_steps: 400000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb

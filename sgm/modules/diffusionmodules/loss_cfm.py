@@ -94,6 +94,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         endpoint_loss_weight: float = 1.0,
         fm_loss_weight: float = 1.0,
         consistency_loss_weight: float = 1.0,
+        consistency_warmup_steps: int = 0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__()
@@ -105,12 +106,25 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.endpoint_loss_weight = endpoint_loss_weight
         self.fm_loss_weight = fm_loss_weight
         self.consistency_loss_weight = consistency_loss_weight
+        # While training from scratch the teacher is random for the first
+        # few thousand steps. Linearly ramp the endpoint/velocity consistency
+        # terms up from 0 so those steps are guided only by the supervised
+        # FM anchor (v* = x_clean − μ). See Yang et al. 2024, Sec. 4.2 —
+        # "two-stage training".
+        self.consistency_warmup_steps = max(int(consistency_warmup_steps), 0)
 
         if not batch2model_keys:
             batch2model_keys = []
         if isinstance(batch2model_keys, str):
             batch2model_keys = [batch2model_keys]
         self.batch2model_keys = set(batch2model_keys)
+
+    def _consistency_ramp(self, batch: Dict) -> float:
+        """Linear warmup multiplier for the consistency / endpoint losses."""
+        if self.consistency_warmup_steps == 0:
+            return 1.0
+        step = int(batch.get("global_step", 0))
+        return min(1.0, step / float(self.consistency_warmup_steps))
 
     # ------------------------------------------------------------------
     # Public interface
@@ -122,7 +136,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         teacher_fn,                    # callable: (x, σ, st, cond, **kw) → v_target
         denoiser: Denoiser,
         conditioner: GeneralConditioner,
-        sigma2st: Sigma2St,            # ConsistencyFlowMatchingSigma2St expected
+        sigma2st: Sigma2St,            # FlowMatchingSigma2St expected
         input: torch.Tensor,           # x_clean  [B, C, H, W]
         mu: torch.Tensor,              # cloudy   [B, C, H, W]
         batch: Dict,
@@ -166,7 +180,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         t_n   = 1.0 - sigma_n
         t_n1  = 1.0 - sigma_n1
 
-        # Time-embedding values via sigma2st  (= t for ConsistencyFlowMatchingSigma2St)
+        # Time-embedding values via sigma2st  (= t for FlowMatchingSigma2St)
         st_n  = sigma2st(sigma_n)
         st_n1 = sigma2st(sigma_n1)
 
@@ -208,9 +222,14 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         velocity_consistency_loss = self._get_loss(v_student, v_target)
         fm_anchor_loss = self._get_loss(v_student, velocity_target)
 
+        # Warmup: disable the consistency / endpoint terms during the first
+        # `consistency_warmup_steps` gradient updates so the student+teacher
+        # first learn a correct velocity field from the supervised anchor.
+        ramp = self._consistency_ramp(batch)
+
         return (
-            self.endpoint_loss_weight * endpoint_loss
-            + self.consistency_loss_weight * velocity_consistency_loss
+            ramp * self.endpoint_loss_weight * endpoint_loss
+            + ramp * self.consistency_loss_weight * velocity_consistency_loss
             + self.fm_loss_weight * fm_anchor_loss
         )
 

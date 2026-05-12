@@ -27,7 +27,7 @@ model:
     teacher_ema_decay: 0.9999         # teacher EMA 衰减率
 
     # ── 加载预训练 EMRDM checkpoint 初始化 student ──────────────────────
-    # ckpt_path: "/path/to/cuhkv2_emrdm_pretrained.ckpt"
+    ckpt_path: "/mnt/d/C-CUHK/result/2026-03-16T01-27-13_example_training-cuhkv2/checkpoints/last-v1.ckpt"
 
     sigma_st_config:
       target: sgm.modules.diffusionmodules.sigma2st.EDMSigma2St
@@ -83,14 +83,18 @@ model:
       target: sgm.modules.diffusionmodules.loss.ConsistencyResidualDiffusionLoss
       params:
         loss_type: "l2"
-        # 训练时用于采样 (σ_n, σ_{n-1}) 对的时间表步数
-        # 对应 cuhkv2 更密集的 sigma 覆盖需求，设为 18
-        num_steps: 18
+        # 训练时用于采样 (σ_n, σ_{n-1}) 对的时间表步数。
+        # cuhkv2 用 p_mean=-1.2,p_std=1.2 训练 teacher，99% 分位在 σ≈11，
+        # 采更密让 teacher 的 Euler 近似更准（见 Enhance.md 修复 #12）。
+        num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 100.0
+            # teacher 训练几乎没有覆盖到 σ>15 的区域，σ_max=100 会让 CD
+            # 在 teacher 的"外推区"蒸馏，误差无意义；裁到 15（修复 #2）。
+            sigma_max: 15.0
+            rho: 7.0
 
     # ── 1-step sampler ────────────────────────────────────────────────────
     sampler_config:
@@ -102,7 +106,18 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 100.0
+            sigma_max: 15.0
+            rho: 7.0
+
+    # 蒸馏微调时的 LR warmup → cosine 衰减
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        warm_up_steps: 500
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.05
+        max_decay_steps: 50000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb
@@ -116,29 +131,29 @@ data:
     train:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
-        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
+        datasets_dir: "/mnt/d/C-CUHK/CUHK-CR2"
+        nir_datasets_dir: "/mnt/d/C-CUHK/nir/CUHK-CR2"
         isTrain: True
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
-        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
+        datasets_dir: "/mnt/d/C-CUHK/CUHK-CR2"
+        nir_datasets_dir: "/mnt/d/C-CUHK/nir/CUHK-CR2"
         isTrain: False
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
-        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
+        datasets_dir: "/mnt/d/C-CUHK/CUHK-CR2"
+        nir_datasets_dir: "/mnt/d/C-CUHK/nir/CUHK-CR2"
         isTrain: False
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/root/autodl-tmp/dataset/CUHK-CR2"
-        nir_datasets_dir: "/root/autodl-tmp/dataset/nir/CUHK-CR2"
+        datasets_dir: "/mnt/d/C-CUHK/CUHK-CR2"
+        nir_datasets_dir: "/mnt/d/C-CUHK/nir/CUHK-CR2"
         isTrain: False
 
 lightning:
@@ -176,4 +191,4 @@ lightning:
     benchmark: True
     accumulate_grad_batches: 1
     check_val_every_n_epoch: 5
-    max_epochs: 500
+    max_epochs: 100

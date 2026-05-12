@@ -98,8 +98,20 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            # σ_max=1.0 makes the sampler start exactly at t=0 (x_init=μ).
+            # FlowMatchingScaling clamps log(1-σ) internally so σ=1 is safe.
+            sigma_max: 1.0
             rho: 1          # rho=1 gives a LINEAR σ schedule, matching FM
+
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        # Multipliers applied on top of base_learning_rate.
+        warm_up_steps: 2000
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.01
+        max_decay_steps: 100000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb

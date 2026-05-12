@@ -900,10 +900,11 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
         @torch.no_grad()
         def teacher_fn(x_tn, sigma_n, sigma_n1, st_n, st_n1, _sigma2st, mu, cond, **extra):
             # ── frozen ODE teacher denoises at σ_n ─────────────────────
-            # Pass dict(cond) so wrappers that edit condition dictionaries
-            # cannot affect subsequent student/target calls in this loss.
+            # Shallow-copy cond so wrappers that mutate it cannot leak
+            # between teacher / student calls within the same loss step.
+            cond_copy = {k: v for k, v in cond.items()}
             denoised_n = denoiser(
-                ode_teacher, x_tn, sigma_n, dict(cond), st_n, **extra
+                ode_teacher, x_tn, sigma_n, cond_copy, st_n, **extra
             )
 
             # ── Euler ODE step: x_tn -> x_tn1 ────────────────────────
@@ -920,7 +921,7 @@ class ConsistencyResidualDiffusionEngine(ResidualDiffusionEngine):
             x_tn1  = (x_tn + d * dt).detach()
 
             # ── EMA target denoises at σ_{n-1} (stop-gradient target) ──
-            f_target = denoiser(teacher, x_tn1, sigma_n1, dict(cond), st_n1, **extra)
+            f_target = denoiser(teacher, x_tn1, sigma_n1, cond_copy, st_n1, **extra)
             return x_tn1, f_target.detach()
 
         return teacher_fn

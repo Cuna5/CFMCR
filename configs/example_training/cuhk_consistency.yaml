@@ -80,13 +80,20 @@ model:
       params:
         loss_type: "l2"
         # Number of discretisation steps used when sampling (σ_n, σ_{n-1})
-        # pairs during training.  More steps → more varied training pairs.
-        num_steps: 18
+        # pairs during training.  Larger values → finer Δσ so that the
+        # teacher's Euler step is a better ODE approximation (see fix #12).
+        num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 100.0
+            # Upper bound of the training σ schedule.  cuhk.yaml trains the
+            # EMRDM teacher with EDMSampling(p_mean=-1.4, p_std=1.4) — the
+            # 99% quantile of that log-normal distribution is ≈17, so the
+            # teacher has no reliable signal at σ=100.  Clip to 20 to stay
+            # inside the teacher's training support (fix #2).
+            sigma_max: 20.0
+            rho: 7.0
 
     # ── 1-step sampler for validation / inference ─────────────────────────
     sampler_config:
@@ -98,7 +105,19 @@ model:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 100.0
+            sigma_max: 20.0
+            rho: 7.0
+
+    # Short LR warmup keeps distillation fine-tuning stable when the
+    # pretrained student weights are still near-optimal.
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        warm_up_steps: 500
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.05
+        max_decay_steps: 50000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb

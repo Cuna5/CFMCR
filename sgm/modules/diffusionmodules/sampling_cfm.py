@@ -25,7 +25,7 @@ the plain FM Direction 1 sampler, but using CFM-trained weights).
 from .sampling_fm import *      # re-export FlowMatchingResidualSampler, …
 from .sampling_fm import FlowMatchingResidualSampler
 
-from ...util import default, tools_scale
+from ...util import append_dims, default, tools_scale
 
 
 class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
@@ -89,16 +89,20 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
         Single-step CFM inference.
 
         Physics:
-            Query the model near t=0 and apply the full consistency jump:
-                x_clean = μ + v
+            Use the same endpoint map the loss was trained on:
+                f(σ, x) = x + σ · v(x, σ)   (σ = 1 − t)
+            Starting from x_init = μ (t ≈ 0, σ ≈ σ_max) the prediction is:
+                x_clean = μ + σ_max · v_θ(μ, σ_max, cond)
+            This matches the training-time endpoint and keeps the network's
+            time conditioning and the applied jump consistent.
         """
-        # Use at least 2 discretization points to safely extract σ_max
-        n_disc = max(self.num_steps, 2) if self.num_steps is not None else 4
-        sigmas    = self.discretization(n_disc, device=mu.device)
-        sigma_max = sigmas[0]
+        # Read σ_max directly from the discretizer config to avoid depending
+        # on `num_steps >= 2` just to index sigmas[0].
+        sigma_max_scalar = float(getattr(self.discretization, "sigma_max", 1.0))
+        sigma_max = mu.new_tensor(sigma_max_scalar)
 
-        uc    = default(uc, cond)
-        s_in  = mu.new_ones([mu.shape[0]])
+        uc = default(uc, cond)
+        s_in = mu.new_ones([mu.shape[0]])
         sigma = s_in * sigma_max
 
         # FM initialisation: start from the cloudy image (t ≈ 0)
@@ -107,12 +111,12 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
         # s(σ_max) = 1 − σ_max = t_init  (very small, ≈ 0.001)
         st = self.sigma2st(sigma)
 
-        # Velocity prediction: v_θ(μ, σ_max, cond) ≈ x_clean − μ
+        # Velocity prediction.  With the endpoint map  f = x + σ·v  a true
+        # 1-step prediction at σ = σ_max becomes  x_clean = μ + σ_max · v.
         v_pred = self._denoise(x_init, denoiser, sigma, cond, st, uc)
 
-        # 1-step consistency prediction over the full t=0 → t=1 interval.
-        # sigma_max only conditions the network near the start of the path.
-        x_clean = x_init + v_pred
+        sigma_bc = append_dims(sigma, x_init.ndim)
+        x_clean = x_init + sigma_bc * v_pred
 
         others = {}
         if return_intermediate:

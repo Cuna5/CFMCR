@@ -391,17 +391,17 @@ $$\mathcal{L}_{CFM} =
 
 ## 新建文件列表
 
-### 1. `sgm/modules/diffusionmodules/sigma2st_cfm.py`（新建）
+### 1. `sgm/modules/diffusionmodules/sigma2st_cfm.py`（~~新建~~ 已移除）
 
-`ConsistencyFlowMatchingSigma2St`，继承 `FlowMatchingSigma2St`（直接 alias），仅提供独立的类名以便 YAML 配置明确标识方向。
+> 早期版本曾引入 `ConsistencyFlowMatchingSigma2St` 作为 `FlowMatchingSigma2St` 的 alias 用以便在 YAML 中标识方向。本次审查认为这只是 `pass` 别名、增加维护成本，已删除。CFM YAML 现直接引用 `sigma2st_fm.FlowMatchingSigma2St`。
 
 $$s(\sigma) = 1 - \sigma = t, \quad \frac{ds}{d\sigma} = -1$$
 
 ---
 
-### 2. `sgm/modules/diffusionmodules/denoiser_scaling_cfm.py`（新建）
+### 2. `sgm/modules/diffusionmodules/denoiser_scaling_cfm.py`（~~新建~~ 已移除）
 
-`ConsistencyFlowMatchingScaling`，继承 `FlowMatchingScaling`（直接 alias）。
+> 同上。CFM YAML 现直接引用 `denoiser_scaling_fm.FlowMatchingScaling`。
 
 | 系数 | 取值 |
 |------|------|
@@ -498,14 +498,17 @@ CFM 在 CUHK-CR1 上的训练配置：
 |------|------|------|
 | `model.target` | `ConsistencyFlowMatchingEngine` | CFM 引擎（`diffusion_cfm.py`） |
 | `teacher_ema_decay` | `0.9999` | EMA teacher 衰减率 |
-| `sigma_st_config.target` | `ConsistencyFlowMatchingSigma2St` | s(σ) = 1-σ |
-| `denoiser_scaling_config.target` | `ConsistencyFlowMatchingScaling` | c_skip=0，速度预测 |
+| `sigma_st_config.target` | `FlowMatchingSigma2St`（`sigma2st_fm`） | s(σ) = 1-σ |
+| `denoiser_scaling_config.target` | `FlowMatchingScaling`（`denoiser_scaling_fm`） | c_skip=0，速度预测 |
 | `loss_fn_config.target` | `ConsistencyFlowMatchingLoss` | CFM 端点 + 速度一致性损失 |
 | `loss_fn_config.params.endpoint_loss_weight` | `1.0` | 端点一致性损失权重 |
+| `loss_fn_config.params.consistency_warmup_steps` | `2000` | 一致性损失线性 warmup 步数（修复 #1） |
 | `loss_fn_config.params.num_steps` | `18` | σ 时间表密度 |
 | `sampler_config.target` | `ConsistencyFlowMatchingSampler` | 1 步采样 |
 | `sampler_config.params.num_steps` | `1` | 推理仅 1 步 |
 | `rho` | `1` | 线性 σ 时间表 |
+| `sigma_max` | `1.0` | 起点严格对齐 t=0（修复 #6） |
+| `scheduler_config` | `LambdaWarmUpCosineScheduler` | LR warmup+cosine（修复 #7） |
 | `max_epochs` | `500` | 从零训练 |
 
 ---
@@ -531,8 +534,6 @@ EMRDM-ODE/
 │   │   └── diffusion_cfm.py              ← 新建（ConsistencyFlowMatchingEngine）
 │   └── modules/
 │       └── diffusionmodules/
-│           ├── sigma2st_cfm.py            ← 新建（ConsistencyFlowMatchingSigma2St）
-│           ├── denoiser_scaling_cfm.py    ← 新建（ConsistencyFlowMatchingScaling）
 │           ├── loss_cfm.py                ← 新建（ConsistencyFlowMatchingLoss）
 │           └── sampling_cfm.py            ← 新建（ConsistencyFlowMatchingSampler）
 └── configs/
@@ -540,6 +541,8 @@ EMRDM-ODE/
         ├── cuhk_cfm.yaml                  ← 新建训练配置
         └── cuhkv2_cfm.yaml                ← 新建训练配置（多时相）
 ```
+
+> CFM 的 `sigma2st_cfm.py`、`denoiser_scaling_cfm.py` 在审查阶段被判定为纯 alias 冗余，已删除，YAML 直接引用对应的 `*_fm.py` 实现（见下方"代码审查与修复记录"）。
 
 > 这些是 CFM 初版新增文件；本次校正已在 `loss_cfm.py`、`sampling_cfm.py`、`diffusion_cfm.py` 与 CFM YAML 中补齐论文对应的端点一致性和一步推理端点处理。
 
@@ -577,3 +580,199 @@ EMRDM-ODE/
 - 非 CUDA 环境自动回退到 `time.perf_counter()`，避免 CPU/MPS 调试时报错。
 - `--test` / validation 中的 `sample_time` 同步写入 Lightning logger；`--predict` 中的 `sample_time` 写入 `metrics.csv`。
 - CD/CFM 子类的 teacher EMA 更新被纳入 `train_time`，因此训练耗时更接近完整 batch 成本。
+
+
+---
+
+# 代码审查与修复记录（2026-05）
+
+本轮对 CD / FM / CFM 三套改进做了一次系统审查，共识别并修复 **13 条** 问题。按严重程度分三组记录。
+
+## 一、严重问题修复
+
+### 修复 #1：CFM 从零训练早期 teacher 随机，增加 consistency warmup
+
+**问题**：
+`diffusion_cfm.py` 中 `teacher = deepcopy(student)`，从零训练时 student/teacher 都是随机权重，`v_target` 前几千步是噪声；但 `endpoint_loss`、`velocity_consistency_loss`、`fm_loss` 三项权重同为 1.0，随机 teacher 会污染梯度方向。这与 Yang et al. 2024《Consistency Flow Matching》Section 4.2 的两阶段训练思路不符。
+
+**修复**：
+在 `ConsistencyFlowMatchingLoss` 增加 `consistency_warmup_steps` 参数（默认 0，保持向后兼容）。当该值 > 0 时：
+
+$$\mathcal{L}_{CFM}=\text{ramp}(\text{step})\cdot[\lambda_f\mathcal{L}_{end}+\lambda_v\mathcal{L}_{vel}]+\lambda_{FM}\mathcal{L}_{FM}$$
+
+其中 $\text{ramp}(k)=\min(1,k/N_{warmup})$。前 N 步只靠 FM anchor 训练速度场，随后线性引入一致性约束。`batch["global_step"]` 由 `ResidualDiffusionEngine.shared_step` 注入。
+
+**相关文件**：
+- `sgm/modules/diffusionmodules/loss_cfm.py`（新增 `consistency_warmup_steps` + `_consistency_ramp`）
+- `configs/example_training/cuhk_cfm.yaml`、`cuhkv2_cfm.yaml`（默认 2000 步）
+
+### 修复 #2：CD σ_max 远超 teacher 训练分布
+
+**问题**：
+`cuhk.yaml` 训练 EMRDM teacher 时 `EDMSampling(p_mean=-1.4, p_std=1.4)`，99% 分位在 σ≈17；`cuhkv2.yaml` 是 `p_mean=-1.2, p_std=1.2`，99% 分位在 σ≈11。但 `cuhk_consistency.yaml` / `cuhkv2_consistency.yaml` 都把 `sigma_max` 设为 100，训练里 teacher 会在完全没见过的分布外 σ 上被调用，Euler 一步的目标是噪声。
+
+**修复**：
+- `cuhk_consistency.yaml`：`sigma_max: 100 → 20`
+- `cuhkv2_consistency.yaml`：`sigma_max: 100 → 15`
+两者都落在对应 teacher 训练分布 99% 分位之内。同步见修复 #12 增大 `num_steps`。
+
+### 修复 #3：CFM 1 步推理端点公式与训练不一致
+
+**问题**：
+训练里端点映射为 $f=x_t+(1-t)v=x_t+\sigma\cdot v$（`loss_cfm.py` 第 170 行 `f_student = x_tn + sigma_n_bc * v_student`）。
+推理里却写 `x_clean = x_init + v_pred`（等价于 σ=1 时的端点映射）。网络实际在 σ=σ_max=0.999 被条件化，系数却按 σ=1 使用，训练与推理语义偏离。
+
+**修复**：
+`sampling_cfm.py::_one_step` 改为：
+```python
+x_clean = x_init + sigma_max · v_pred
+```
+与训练端点严格一致。引入 `append_dims` 做批维广播。
+
+### 修复 #4：`ResidualDiffusionLoss` 的 `mu *= ...` 原地改写
+
+**问题**：
+`loss.py::ResidualDiffusionLoss._forward` 第 134 行 `mu *= ((1.0-st_bc)/st_bc)` 是原地操作。`mu` 由 engine 编码后传入，原地改写会污染外部。当前调用栈里之后没人再用它，但：
+- 子类如果先 `super()._forward(...)` 再读 `mu`，拿到的是已缩放的；
+- 开启 `retain_graph` / 梯度检查点反传时 in-place 触发 autograd 报错；
+- `TemporalResidualDiffusionLoss._forward` 里有同样问题。
+
+**修复**：
+两处都改为 `mu_shifted = mu * ((1.0-st_bc)/st_bc)`，用新张量。
+
+### 修复 #5：文档声称 CD/CFM 可直接用于多时相，实际不行
+
+**问题**：
+`Operate.md`"多时相（Sen2_MTC）扩展"段落让用户把 `model.target` 换成 `ConsistencyResidualDiffusionEngine` 即可。但：
+- 该 engine 继承自 `ResidualDiffusionEngine`，**不是** `TemporalResidualDiffusionEngine`；
+- `shared_step` / `sample` / `log_images` 签名都不同，直接替换会在 5D 时序张量上报错。
+
+**修复**：
+更新 `Operate.md`，明确 CD/CFM 当前**只支持单时相**。多时相支持需要专门的 `TemporalConsistencyFlowMatchingEngine`（继承 `TemporalResidualDiffusionEngine`，重写 temporal `shared_step` 和 sample 流程）。这是 follow-up 工作，不在本轮修复范围内。
+
+## 二、优化类改进
+
+### 修复 #6：FM/CFM 起点 σ_max 从 0.999 调到 1.0
+
+**问题**：
+`x_init = μ` 对应 t=0（σ=1）；但第一步用 σ=σ_max=0.999（t=0.001）调用网络，少走 t∈[0, 0.001] 的极小段。
+
+**修复**：
+所有 FM / CFM YAML 的 `sigma_max: 0.999 → 1.0`。这一改动安全的前提是 `FlowMatchingScaling` 已对 `log(1-σ)` 做 `.clamp(min=1e-4)`（第 45 行），σ=1 不会产生 NaN。
+
+### 修复 #7：加 LR warmup + cosine 衰减
+
+**问题**：
+CFM、FM 从零训练，之前 `base_learning_rate=1e-4` 全程 flat，容易在前几百步因大梯度发散。
+
+**修复**：
+所有 4 个 FM/CFM yaml 以及 2 个 CD yaml 都接入 `sgm.lr_scheduler.LambdaWarmUpCosineScheduler`：
+- 从零训练（FM/CFM）：warmup 2000 步、cosine 衰减到 1% 起点值；
+- 蒸馏微调（CD）：warmup 500 步、衰减到 5%。
+
+`scheduler_config` 是 `DiffusionEngine.__init__` 原生支持的字段，`configure_optimizers` 里会自动包成 per-step 的 `LambdaLR`。
+
+### 修复 #8：删除 CFM 的 alias 类冗余
+
+**问题**：
+`sigma2st_cfm.py::ConsistencyFlowMatchingSigma2St` 和 `denoiser_scaling_cfm.py::ConsistencyFlowMatchingScaling` 都只是 `pass` 的别名，维护成本大于命名清晰带来的收益。
+
+**修复**：
+- 删除 `sgm/modules/diffusionmodules/sigma2st_cfm.py`
+- 删除 `sgm/modules/diffusionmodules/denoiser_scaling_cfm.py`
+- CFM YAML 改为直接引用 `sigma2st_fm.FlowMatchingSigma2St` / `denoiser_scaling_fm.FlowMatchingScaling`
+- `diffusion_cfm.py` 和 `loss_cfm.py` 的 docstring 同步更新
+
+### 修复 #9：1 步推理的 discretization 浪费调用
+
+**问题**：
+`sampling_cfm.py::_one_step` 先构造完整时间表再取 `sigmas[0]`：
+```python
+n_disc = max(self.num_steps, 2) if self.num_steps is not None else 4
+sigmas = self.discretization(n_disc, device=mu.device)
+sigma_max = sigmas[0]
+```
+这里的 `max(1, 2)` 是个为了躲 `num_steps=1` 的 hack。
+
+**修复**：
+直接读 `self.discretization.sigma_max`：
+```python
+sigma_max_scalar = float(getattr(self.discretization, "sigma_max", 1.0))
+sigma_max = mu.new_tensor(sigma_max_scalar)
+```
+更直接也消除了 hack。
+
+### 修复 #11：teacher_fn 的 cond 浅克隆改规范
+
+**问题**：
+`diffusion_cfm.py` / `diffusion.py`（CD）里用 `dict(cond)` 做浅拷贝防 conditioner 原地修改。动机对，但 `dict(c)` 语义等价于 `c.copy()`，如果 conditioner 改动的是嵌套值（例如 `cond["concat"] = ...`）能防住，但如果是更深层字段就不够。当前 conditioner 没有原地行为，属于"半生不熟"的防御。
+
+**修复**：
+统一成显式字典推导 `{k: v for k, v in cond.items()}`，意图更清楚，留下后续如需深克隆可直接替换的切入点。
+
+### 修复 #12：CD 训练 sigma pair 粒度偏粗
+
+**问题**：
+`num_steps=18` + `ρ=7` + `sigma_max=100`，相邻 σ 间隔在高噪声段最大可达 1.5–2×。teacher Euler 一步跨过的真实 ODE 弧线在这段内误差大，蒸馏目标不精。
+
+**修复**：
+`num_steps: 18 → 40`（两个 CD yaml 同步）。相邻 Δσ 减半，teacher Euler 一步的泰勒残差下降一阶。
+
+### 修复 #13：补 teacher EMA / CFM 的语义注释
+
+**问题**：
+`ConsistencyFlowMatchingEngine.on_train_batch_end` 先 `_update_teacher()` 后 `super()` 调用，读者容易误解为"teacher 在梯度更新前就同步"。实际 `on_train_batch_end` 本身发生在梯度 step 之后，所以 teacher EMA 基于"已更新的 student"是正确的。
+
+**修复**：
+不改代码（行为正确），但在 docstring 里注明"EMA teacher 更新发生在 student 梯度 step 之后，因此使用的是新 student 权重"。
+
+## 三、与论文吻合度复核
+
+| 核心点 | 参考论文 | 代码实现 | 状态 |
+|--------|---------|---------|------|
+| FM OT 路径 $x_t=(1-t)\mu+t\cdot x_1$ | Lipman 2022 | `loss_fm.py::_forward` | ✓ |
+| FM 速度目标 $v^*=x_1-\mu$ | Lipman 2022 | `loss_fm.py::_forward` | ✓ |
+| CD Euler solver 与 target 分离 | Song 2023 | `diffusion.py::_make_teacher_fn` | ✓ |
+| CFM 端点映射 $f=x+(1-t)v=x+\sigma v$ | Yang 2024 | `loss_cfm.py`（训练）+ `sampling_cfm.py`（推理，修复 #3 后一致） | ✓ |
+| CFM 两阶段训练（FM anchor 先行） | Yang 2024 §4.2 | `consistency_warmup_steps`（修复 #1） | ✓ |
+| CFM piecewise 分段训练 | Yang 2024 §4.3 | 未实装 | ✗（follow-up） |
+
+分段训练可以作为后续增强：把 $[0,1]$ 切成 K 段，每段独立维护 teacher，前期段长大、后期段长小，可进一步提升 1 步精度。实装需要在 loss 里同时采样段索引和段内 σ 对，并把 `num_pieces` 作为超参。
+
+## 四、命中的所有文件
+
+```
+代码：
+  sgm/modules/diffusionmodules/loss.py         # 修复 #4（×2 处）
+  sgm/modules/diffusionmodules/loss_cfm.py     # 修复 #1, #8 docstring
+  sgm/modules/diffusionmodules/sampling_cfm.py # 修复 #3, #9, append_dims import
+  sgm/models/diffusion.py                      # 修复 #11（CD teacher_fn）
+  sgm/models/diffusion_cfm.py                  # 修复 #8 docstring, #11, #13
+
+删除：
+  sgm/modules/diffusionmodules/sigma2st_cfm.py         # 修复 #8
+  sgm/modules/diffusionmodules/denoiser_scaling_cfm.py # 修复 #8
+
+配置（FM）：
+  configs/example_training/cuhk_fm.yaml        # 修复 #6, #7
+  configs/example_training/cuhkv2_fm.yaml      # 修复 #6, #7
+
+配置（CFM）：
+  configs/example_training/cuhk_cfm.yaml       # 修复 #1, #6, #7, #8
+  configs/example_training/cuhkv2_cfm.yaml     # 修复 #1, #6, #7, #8
+
+配置（CD）：
+  configs/example_training/cuhk_consistency.yaml    # 修复 #2, #7, #12
+  configs/example_training/cuhkv2_consistency.yaml  # 修复 #2, #7, #12
+
+文档：
+  Enhance.md      # 本章节 + 新建文件清单更新
+  Operate.md      # 修复 #5（多时相说明），新增 consistency_warmup_steps 等参数说明
+```
+
+## 五、后续建议
+
+1. **CFM piecewise 训练**：论文 §4.3 的关键提升手段，对 1 步推理质量贡献可观。建议作为新 spec 单独实装。
+2. **TemporalConsistencyFlowMatchingEngine**：解决修复 #5 提到的多时相支持缺口。
+3. **消融开关**：`fm_loss_weight=0 / consistency_loss_weight=0` 的消融 YAML 可以放进 `configs/example_training/ablation/`，方便后续论文撰写。
+4. **单元测试**：对 4 套 sampler 和 loss 加最基础的 shape/range sanity test；research code 不强制，但跑大规模实验前补几个会省返工。
