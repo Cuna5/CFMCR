@@ -1,26 +1,34 @@
 """
-Consistency Flow Matching denoiser scaling.
+Denoiser scaling for Consistency Flow Matching.
 
-Re-exports from denoiser_scaling_fm and adds a named alias for CFM so that
-YAML configs can reference a CFM-specific class name.
+The CFM network predicts the OT velocity directly:
 
-The velocity-prediction preconditioning is identical to FlowMatchingScaling:
-  c_skip = 0     (no residual skip — raw network output IS the velocity)
-  c_out  = 1
-  c_in   = 1
-  c_noise = 0.25 · log(t),   t = 1 − σ
+    v_theta(x_t, t, mu) ~= x_clean - mu
+
+so the denoiser wrapper should return the raw network output as the velocity.
 """
 
-from .denoiser_scaling_fm import *      # re-export FlowMatchingScaling, …
-from .denoiser_scaling_fm import FlowMatchingScaling
+from typing import Tuple
+
+import torch
+
+from .denoiser_scaling import DenoiserScaling
 
 
-class ConsistencyFlowMatchingScaling(FlowMatchingScaling):
-    """
-    Velocity-prediction preconditioning for CFM (Direction 3).
+class ConsistencyFlowMatchingScaling(DenoiserScaling):
+    """Velocity-prediction preconditioning for CFM."""
 
-    Identical to FlowMatchingScaling (c_skip=0, c_out=1, c_in=1).
-    Provided under a distinct name so that CFM configs can declare
-        target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
-    """
-    pass
+    def __call__(
+        self,
+        sigma: torch.Tensor,
+        st: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        c_skip = torch.zeros_like(sigma)
+        c_out = torch.ones_like(sigma)
+        c_in = torch.ones_like(sigma)
+
+        # t = 1 - sigma. Clamp away from zero for stable log-time embedding.
+        t = (1.0 - sigma).clamp(min=1e-4)
+        c_noise = 0.25 * torch.log(t)
+
+        return c_skip, c_out, c_in, c_noise

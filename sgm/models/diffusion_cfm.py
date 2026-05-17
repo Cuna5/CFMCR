@@ -1,31 +1,21 @@
 """
 Consistency Flow Matching training engine.
 
-Implements Direction 3: Consistency Flow Matching (CFM).
-
 Key idea
 --------
-CFM combines:
-  • The straight-line OT paths of Flow Matching  (x_t = (1-t)·μ + t·x_clean)
-  • Endpoint and velocity self-consistency constraints from Consistency-FM
+CFM uses straight-line OT paths with endpoint and velocity self-consistency:
+
+    x_t = (1 - t) * mu + t * x_clean
 
 Training from scratch (no two-stage pre-training required):
   1. Build x_{t_n} and x_{t_{n+1}} from the closed-form OT formula.
   2. Teacher (EMA) predicts velocity at x_{t_{n+1}} → v_{target}.
   3. Student predicts velocity at x_{t_n} → v_{student}.
   4. Enforce endpoint consistency on f(t, x) = x + (1 - t) * v(t, x).
-  5. Add velocity consistency and the supervised FM anchor v* = x_clean − μ.
-  6. Loss: endpoint consistency + velocity consistency + λ_FM anchor.
+  5. Add velocity consistency, velocity anchor, and clean endpoint supervision.
 
 At inference a single network call from x = μ gives:
     x_clean ≈ μ + v_θ(μ, σ_max, cond)
-
-Differences vs. ConsistencyResidualDiffusionEngine
----------------------------------------------------
-* Teacher step:  FM path construction (exact OT formula, no ODE simulation).
-* Teacher fn:    simpler signature — wraps a single teacher denoiser call.
-* No noise is added when building training points.
-* Network predicts velocity, not x_clean.
 
 Requires in YAML config:
     model.target: sgm.models.diffusion_cfm.ConsistencyFlowMatchingEngine
@@ -109,15 +99,19 @@ class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
             teacher_fn(x, sigma, st, cond, **extra) -> v_target  (detached)
 
         Note: x_{t_{n+1}} is constructed directly from the OT formula inside
-        ConsistencyFlowMatchingLoss._forward() — the teacher only needs ONE
-        forward pass per training step, unlike CD which requires two.
+        ConsistencyFlowMatchingLoss._forward(), so the teacher only needs one
+        forward pass per training step.
         """
         denoiser = self.denoiser
         teacher  = self.teacher_model
 
         @torch.no_grad()
         def teacher_fn(x, sigma, st, cond, **extra):
-            v = denoiser(teacher, x, sigma, dict(cond), st, **extra)
+            # Shallow-copy the cond dict so wrappers that mutate it cannot
+            # leak into the student forward pass. Inner tensors are shared
+            # but not modified in-place anywhere in the current codebase.
+            cond_copy = {k: v for k, v in cond.items()}
+            v = denoiser(teacher, x, sigma, cond_copy, st, **extra)
             return v.detach()
 
         return teacher_fn

@@ -1,32 +1,17 @@
 ##############################################################################
 # EMRDM — Consistency Flow Matching (CUHK-CR1 dataset)
 #
-# Implements Direction 3: Consistency Flow Matching (CFM) for cloud removal.
-#
 # Key idea
 # --------
-# CFM unifies Flow Matching (straight OT paths) with the consistency
-# self-constraint (same velocity predicted for any t on the same trajectory):
+# CFM uses a straight OT path plus endpoint / velocity consistency:
 #
 #   x_t = (1-t)·μ + t·x_clean            (OT path, no extra noise)
 #   f_θ(t, x_t) = x_t + (1-t)·v_θ(x_t, t)
-#   Loss: endpoint consistency + velocity consistency + supervised FM anchor
+#   Loss: endpoint consistency + velocity consistency + clean endpoint anchor
 #
 # Training from scratch — no pre-trained checkpoint required.
 # At inference a SINGLE network call recovers the cloud-free image:
 #   x_clean ≈ μ + v_θ(μ, σ_max)
-#
-# Comparison table
-# ----------------
-# | Component     | FM (Direction 1)              | CFM (Direction 3)               |
-# |---------------|-------------------------------|---------------------------------|
-# | engine        | ResidualDiffusionEngine       | ConsistencyFlowMatchingEngine   |
-# | loss          | FlowMatchingResidualDiffLoss  | ConsistencyFlowMatchingLoss     |
-# | sampler       | FlowMatchingResidualSampler   | ConsistencyFlowMatchingSampler  |
-# | inference     | 4–10 Euler steps              | 1 step (default)               |
-# | teacher       | none                          | EMA of student (0.9999 decay)   |
-# | path          | straight OT (same)            | straight OT                     |
-# | pre-training  | not required                  | not required                    |
 ##############################################################################
 
 model:
@@ -40,8 +25,8 @@ model:
     image_metrics: "evaluator"
     teacher_ema_decay: 0.9999       # EMA decay for the CFM teacher model
 
-    # Optional: warm-start from an FM checkpoint for faster convergence.
-    # ckpt_path: "/path/to/fm_pretrained.ckpt"
+    # Optional: warm-start from a CFM checkpoint.
+    # ckpt_path: "/path/to/cfm_pretrained.ckpt"
 
     sigma_st_config:
       target: sgm.modules.diffusionmodules.sigma2st_cfm.ConsistencyFlowMatchingSigma2St
@@ -93,31 +78,49 @@ model:
       target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
       params:
         loss_type: "l2"
-        endpoint_loss_weight: 1.0    # endpoint consistency: f=x+(1-t)v
-        consistency_loss_weight: 1.0 # velocity consistency
-        fm_loss_weight: 1.0         # supervised anchor: v* = x_clean - μ
+        endpoint_loss_weight: 0.5    # teacher endpoint consistency
+        consistency_loss_weight: 0.5 # teacher velocity consistency
+        velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
+        clean_endpoint_loss_weight: 1.0  # direct fθ -> x_clean metric anchor
+        start_pair_prob: 0.35            # oversample σ≈1 for 1-step quality
+        # Two-stage training (Yang et al. 2024, Sec. 4.2): the endpoint /
+        # velocity consistency terms are linearly ramped up from 0 over the
+        # first `consistency_warmup_steps` updates so the student + teacher
+        # first learn a correct velocity from supervised anchors.
+        consistency_warmup_steps: 2000
         # Number of σ levels used to sample consecutive (σ_n, σ_{n+1}) pairs.
         # More steps → finer pairs, better coverage of the OT path.
-        num_steps: 18
+        num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0   # σ=1 matches t=0 (start from μ); scaling clamps log
             rho: 1       # linear σ schedule  ↔  uniform t training
 
     # ── 1-step CFM sampler for validation / inference ─────────────────────
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling_cfm.ConsistencyFlowMatchingSampler
       params:
-        # Set num_steps=1 for true 1-step inference; >1 falls back to FM Euler.
+        # Set num_steps=1 for true 1-step inference; >1 uses CFM Euler steps.
         num_steps: 1
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 0.999
+            sigma_max: 1.0
             rho: 1
+
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        # Multipliers applied on top of base_learning_rate (1e-4).
+        # Warmup 0.01→1.0 over 2000 steps, then cosine decay to 0.01.
+        warm_up_steps: 2000
+        lr_start: 0.01
+        lr_max: 1.0
+        lr_min: 0.01
+        max_decay_steps: 100000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb
