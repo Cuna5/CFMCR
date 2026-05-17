@@ -1,13 +1,13 @@
 """
 Consistency Flow Matching loss.
 
-Re-exports all FM loss classes and adds:
-  - ConsistencyFlowMatchingLoss: endpoint and velocity consistency loss on
-    OT straight paths.
+Adds:
+  - ConsistencyFlowMatchingLoss: endpoint, velocity, and clean-endpoint
+    consistency loss on OT straight paths.
 
 Mathematical background
 -----------------------
-For two consecutive FM time steps  t_n < t_{n+1}  (σ_n > σ_{n+1}):
+For two consecutive CFM time steps  t_n < t_{n+1}  (σ_n > σ_{n+1}):
 
   x_{t_n}    = (1 − t_n)·μ  +  t_n·x_clean       ← exact OT path, no noise
   x_{t_{n+1}} = (1 − t_{n+1})·μ + t_{n+1}·x_clean  ← exact OT path, no noise
@@ -16,7 +16,7 @@ Because the OT path is deterministic and x_clean is known during training,
 both interpolation points can be computed directly — NO ODE simulation is
 needed, and the teacher only requires ONE forward pass.
 
-Consistency-FM uses an endpoint map:
+CFM uses an endpoint map:
 
     f_θ(t, x_t, μ) = x_t + (1 − t) · v_θ(x_t, t, μ)
 
@@ -25,10 +25,15 @@ and constrains both endpoint predictions and velocity fields:
     L_end = ‖ f_θ(t_n, x_{t_n}, μ) − f_{θ⁻}(t_{n+1}, x_{t_{n+1}}, μ) ‖²
     L_vel = ‖ v_θ(x_{t_n}, t_n, μ) − v_{θ⁻}(x_{t_{n+1}}, t_{n+1}, μ) ‖²
 
-The supervised FM anchor keeps that self-consistent velocity tied to the true
-OT direction:
+The supervised velocity anchor keeps that self-consistent velocity tied to the
+true OT direction:
 
-    L_FM = ‖ v_θ(x_{t_n}, t_n, μ) − (x_clean − μ) ‖²
+    L_vel_anchor = ‖ v_θ(x_{t_n}, t_n, μ) − (x_clean − μ) ‖²
+
+For better 1-step image metrics, the student endpoint is also supervised
+directly against the clean image:
+
+    L_clean_end = ‖ f_θ(t_n, x_{t_n}, μ) − x_clean ‖²
 
 where:
   • v_θ       is the student (receives gradients)
@@ -37,18 +42,9 @@ where:
 At inference a **single** network call from x = μ (t ≈ 0) yields
 x_clean ≈ μ + v_θ(μ, t≈0, μ) · 1.
 
-Differences vs. ConsistencyResidualDiffusionLoss
-------------------------------------------------
-* Path: straight OT line  (not EMRDM mean-reverting noisy path)
-* Target: velocity v (not x_clean)
-* x_{t_{n+1}}: computed from OT formula  (not from an Euler ODE step)
-* Teacher: one call at x_{t_{n+1}}  (not two calls around the Euler step)
-
 Compatible with ConsistencyFlowMatchingEngine (forward() receives teacher_fn
-as second positional argument, same pattern as ConsistencyResidualDiffusionLoss).
+as the second positional argument).
 """
-
-from .loss_fm import *  # re-export FlowMatchingResidualDiffusionLoss, …
 
 from typing import Dict, List, Optional, Union
 import torch
@@ -71,18 +67,24 @@ class ConsistencyFlowMatchingLoss(nn.Module):
 
     Args:
         discretization_config: Config for EDMDiscretization.  Use
-            sigma_min=0.001, sigma_max=0.999, rho=1 for a linear schedule
-            that matches uniform-t FM training.
+            sigma_min=0.001, sigma_max=1.0, rho=1 for a linear schedule
+            that matches uniform-t CFM training.
         loss_type: "l2" (default) or "l1".
         num_steps:  Number of discretisation steps used to build the σ
             schedule from which consecutive pairs (σ_n, σ_{n+1}) are sampled.
         endpoint_loss_weight: Weight for the endpoint consistency term
             ||f_θ(t, x_t) - f_{θ⁻}(t+Δt, x_{t+Δt})||².
-        fm_loss_weight: Weight for the supervised FM anchor term. Keep this
-            greater than 0 when training from scratch; consistency alone can
-            learn a self-consistent but wrong velocity field.
+        velocity_anchor_loss_weight: Weight for the supervised velocity anchor.
+            Keep this greater than 0 when training from scratch; consistency
+            alone can learn a self-consistent but wrong velocity field.
         consistency_loss_weight: Weight for the teacher-student velocity
             consistency term.
+        clean_endpoint_loss_weight: Weight for direct supervision of
+            f_θ(t, x_t, μ) against x_clean. This biases training toward the
+            exact image metric target used in 1-step inference.
+        start_pair_prob: Probability of replacing the sampled pair with the
+            first pair at σ_max. This gives more updates to the state used by
+            true 1-step inference (x=μ, σ≈1).
         batch2model_keys: Keys forwarded from batch to the network.
     """
 
@@ -92,25 +94,29 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         loss_type: str = "l2",
         num_steps: int = 18,
         endpoint_loss_weight: float = 1.0,
-        fm_loss_weight: float = 1.0,
+        velocity_anchor_loss_weight: float = 1.0,
         consistency_loss_weight: float = 1.0,
+        clean_endpoint_loss_weight: float = 1.0,
+        start_pair_prob: float = 0.25,
         consistency_warmup_steps: int = 0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__()
         assert loss_type in ["l2", "l1"], f"Unsupported loss_type: {loss_type}"
+        assert num_steps >= 2, "ConsistencyFlowMatchingLoss requires num_steps >= 2"
 
         self.discretization = instantiate_from_config(discretization_config)
         self.loss_type = loss_type
         self.num_steps = num_steps
         self.endpoint_loss_weight = endpoint_loss_weight
-        self.fm_loss_weight = fm_loss_weight
+        self.velocity_anchor_loss_weight = velocity_anchor_loss_weight
         self.consistency_loss_weight = consistency_loss_weight
+        self.clean_endpoint_loss_weight = clean_endpoint_loss_weight
+        self.start_pair_prob = min(max(float(start_pair_prob), 0.0), 1.0)
         # While training from scratch the teacher is random for the first
         # few thousand steps. Linearly ramp the endpoint/velocity consistency
         # terms up from 0 so those steps are guided only by the supervised
-        # FM anchor (v* = x_clean − μ). See Yang et al. 2024, Sec. 4.2 —
-        # "two-stage training".
+        # velocity anchor (v* = x_clean − μ).
         self.consistency_warmup_steps = max(int(consistency_warmup_steps), 0)
 
         if not batch2model_keys:
@@ -136,7 +142,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         teacher_fn,                    # callable: (x, σ, st, cond, **kw) → v_target
         denoiser: Denoiser,
         conditioner: GeneralConditioner,
-        sigma2st: Sigma2St,            # FlowMatchingSigma2St expected
+        sigma2st: Sigma2St,            # ConsistencyFlowMatchingSigma2St expected
         input: torch.Tensor,           # x_clean  [B, C, H, W]
         mu: torch.Tensor,              # cloudy   [B, C, H, W]
         batch: Dict,
@@ -173,14 +179,17 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         sigmas = self.discretization(self.num_steps, device=device)
         valid_len = len(sigmas) - 1          # exclude last entry (σ_min itself)
         indices   = torch.randint(0, valid_len, (B,), device=device)
+        if self.start_pair_prob > 0.0:
+            start_mask = torch.rand(B, device=device) < self.start_pair_prob
+            indices = torch.where(start_mask, torch.zeros_like(indices), indices)
         sigma_n   = sigmas[indices]           # σ_n  (larger = more cloudy, t_n small)
         sigma_n1  = sigmas[indices + 1]       # σ_{n+1} (smaller = more clean, t_{n+1} large)
 
-        # t = 1 − σ  (FM time)
+        # t = 1 − σ  (CFM time)
         t_n   = 1.0 - sigma_n
         t_n1  = 1.0 - sigma_n1
 
-        # Time-embedding values via sigma2st  (= t for FlowMatchingSigma2St)
+        # Time-embedding values via sigma2st  (= t for CFM sigma2st)
         st_n  = sigma2st(sigma_n)
         st_n1 = sigma2st(sigma_n1)
 
@@ -207,12 +216,12 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             network, x_tn, sigma_n, cond, st_n, **additional_model_inputs
         )
 
-        # ── 5. Consistency-FM endpoint map f(t, x) = x + (1 - t) v(t, x) ──
+        # ── 5. CFM endpoint map f(t, x) = x + (1 - t) v(t, x) ─────────────
         # Because σ = 1 - t, the remaining time to the endpoint is σ.
         f_student = x_tn + sigma_n_bc * v_student
         f_target = x_tn1 + sigma_n1_bc * v_target
 
-        # ── 6. Supervised FM anchor: true OT velocity ──────────────────────
+        # ── 6. Supervised velocity anchor: true OT velocity ────────────────
         # Consistency alone only makes the velocity constant along a
         # trajectory; this term pins that constant to the correct direction.
         velocity_target = input - mu
@@ -220,17 +229,19 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         # ── 7. Combined CFM loss ───────────────────────────────────────────
         endpoint_loss = self._get_loss(f_student, f_target.detach())
         velocity_consistency_loss = self._get_loss(v_student, v_target)
-        fm_anchor_loss = self._get_loss(v_student, velocity_target)
+        velocity_anchor_loss = self._get_loss(v_student, velocity_target)
+        clean_endpoint_loss = self._get_loss(f_student, input)
 
         # Warmup: disable the consistency / endpoint terms during the first
         # `consistency_warmup_steps` gradient updates so the student+teacher
-        # first learn a correct velocity field from the supervised anchor.
+        # first learn a correct velocity field from the supervised anchors.
         ramp = self._consistency_ramp(batch)
 
         return (
             ramp * self.endpoint_loss_weight * endpoint_loss
             + ramp * self.consistency_loss_weight * velocity_consistency_loss
-            + self.fm_loss_weight * fm_anchor_loss
+            + self.velocity_anchor_loss_weight * velocity_anchor_loss
+            + self.clean_endpoint_loss_weight * clean_endpoint_loss
         )
 
     def _get_loss(

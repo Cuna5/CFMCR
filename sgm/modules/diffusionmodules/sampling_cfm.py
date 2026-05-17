@@ -1,58 +1,85 @@
 """
-Consistency Flow Matching samplers.
+Consistency Flow Matching sampler.
 
-Re-exports everything from sampling_fm and adds:
-  - ConsistencyFlowMatchingSampler: supports both 1-step and multi-step
-    inference for a trained CFM consistency model.
+The default path is true 1-step inference:
 
-1-step inference
-----------------
-The CFM consistency model satisfies the self-consistency property over
-velocity fields.  A single call from x = μ (t ≈ 0, σ ≈ 1) suffices:
+    x_init = mu
+    v = v_theta(mu, sigma_max, cond)
+    x_clean = mu + sigma_max * v
 
-    v = v_θ(μ, σ_max, cond)            # network predicts x_clean − μ
-    x_clean = μ + v                    # full t=0 → t=1 consistency jump
-
-This is the single full-range consistency jump used for 1-step inference.
-
-Multi-step inference
---------------------
-When num_steps > 1 the sampler falls back to the standard FM Euler ODE
-loop inherited from FlowMatchingResidualSampler (identical behaviour to
-the plain FM Direction 1 sampler, but using CFM-trained weights).
+When ``num_steps > 1`` the same trained CFM velocity field is integrated with
+Euler steps in sigma space, which provides a quality/speed tradeoff without
+requiring a separate sampler module.
 """
 
-from .sampling_fm import *      # re-export FlowMatchingResidualSampler, …
-from .sampling_fm import FlowMatchingResidualSampler
+from typing import Dict, Union
 
-from ...util import append_dims, default, tools_scale
+from omegaconf import ListConfig
+
+from ...util import append_dims, default, instantiate_from_config, tools_scale
 
 
-class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
-    """
-    Sampler for a Consistency Flow Matching cloud-removal model.
+class ConsistencyFlowMatchingSampler:
+    """Sampler for CFM cloud removal models."""
 
-    Supports two inference modes (controlled by num_steps in config or at
-    call time):
+    def __init__(
+        self,
+        discretization_config: Union[Dict, ListConfig],
+        num_steps: Union[int, None] = None,
+        guider_config: Union[Dict, ListConfig, None] = None,
+        verbose: bool = False,
+        device: str = "cuda",
+    ):
+        self.num_steps = num_steps
+        self.discretization = instantiate_from_config(discretization_config)
 
-    * **1-step** (num_steps = 1):
-        x_init = μ  (start from the cloudy image)
-        v = v_θ(μ, σ_max, cond)
-        x_clean = μ + v                  (single full-range consistency step)
+        default_guider = {
+            "target": "sgm.modules.diffusionmodules.guiders.IdentityGuider"
+        }
+        self.guider = instantiate_from_config(default(guider_config, default_guider))
+        self.verbose = verbose
+        self.device = device
+        self.sigma2st = None
 
-    * **multi-step** (num_steps > 1):
-        Identical to FlowMatchingResidualSampler — Euler ODE from σ_max
-        down to σ_min in num_steps uniform steps.
+    def set_sigma2st(self, sigma2st):
+        self.sigma2st = sigma2st
 
-    Calling convention is identical to FlowMatchingResidualSampler so the
-    sampler can be swapped without engine changes.
-    """
+    def _get_sigma_gen(self, num_sigmas):
+        from tqdm import tqdm
+
+        gen = range(num_sigmas - 1)
+        if self.verbose:
+            gen = tqdm(gen, total=num_sigmas, desc=f"CFM Sampling ({num_sigmas - 1} steps)")
+        return gen
+
+    def _denoise(self, x, denoiser, sigma, cond, st, uc):
+        velocity = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc), st=st)
+        return self.guider(velocity, sigma)
+
+    def _prepare_loop(self, x_randn, mu, cond, uc, num_steps):
+        sigmas = self.discretization(
+            self.num_steps if num_steps is None else num_steps,
+            device=self.device,
+        )
+        uc = default(uc, cond)
+        x_init = mu.clone()
+        s_in = x_init.new_ones([x_init.shape[0]])
+        return x_init, s_in, sigmas, len(sigmas), cond, uc
+
+    def _sampler_step(self, sigma, next_sigma, denoiser, x, mu, cond, uc):
+        st = self.sigma2st(sigma)
+        v_pred = self._denoise(x, denoiser, sigma, cond, st, uc)
+        sigma_bc = append_dims(sigma, x.ndim)
+        endpoint = x + sigma_bc * v_pred
+        dt = append_dims(next_sigma - sigma, x.ndim)
+        x_next = x - v_pred * dt
+        return x_next, endpoint
 
     def __call__(
         self,
         denoiser,
-        x,              # randn from engine.sample() — ignored, we init from μ
-        mu,             # cloudy image  [B, C, H, W]
+        x,
+        mu,
         cond,
         uc=None,
         num_steps=None,
@@ -62,18 +89,54 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
         n = self.num_steps if num_steps is None else num_steps
         if n == 1:
             return self._one_step(
-                denoiser, x, mu, cond, uc,
-                return_intermediate, return_denoised,
+                denoiser, x, mu, cond, uc, return_intermediate, return_denoised
             )
-        # Multi-step: delegate to FM Euler loop
-        return super().__call__(
-            denoiser, x, mu, cond, uc, num_steps,
-            return_intermediate, return_denoised,
+        return self._multi_step(
+            denoiser, x, mu, cond, uc, num_steps, return_intermediate, return_denoised
         )
 
-    # ------------------------------------------------------------------
-    # True 1-step inference
-    # ------------------------------------------------------------------
+    def _multi_step(
+        self,
+        denoiser,
+        x,
+        mu,
+        cond,
+        uc=None,
+        num_steps=None,
+        return_intermediate: bool = False,
+        return_denoised: bool = False,
+    ):
+        x, s_in, sigmas, num_sigmas, cond, uc = self._prepare_loop(
+            x, mu, cond, uc, num_steps
+        )
+
+        intermediates = []
+        denoiseds = []
+
+        for i in self._get_sigma_gen(num_sigmas):
+            if return_intermediate:
+                intermediates.append(tools_scale(x.clone().detach()))
+
+            x, endpoint = self._sampler_step(
+                s_in * sigmas[i],
+                s_in * sigmas[i + 1],
+                denoiser,
+                x,
+                mu,
+                cond,
+                uc,
+            )
+
+            if return_denoised:
+                denoiseds.append(tools_scale(endpoint.clone().detach()))
+
+        others = {}
+        if return_intermediate:
+            others["intermediates"] = intermediates
+        if return_denoised:
+            others["denoiseds"] = denoiseds
+
+        return x, others
 
     def _one_step(
         self,
@@ -85,36 +148,16 @@ class ConsistencyFlowMatchingSampler(FlowMatchingResidualSampler):
         return_intermediate: bool = False,
         return_denoised: bool = False,
     ):
-        """
-        Single-step CFM inference.
-
-        Physics:
-            Use the same endpoint map the loss was trained on:
-                f(σ, x) = x + σ · v(x, σ)   (σ = 1 − t)
-            Starting from x_init = μ (t ≈ 0, σ ≈ σ_max) the prediction is:
-                x_clean = μ + σ_max · v_θ(μ, σ_max, cond)
-            This matches the training-time endpoint and keeps the network's
-            time conditioning and the applied jump consistent.
-        """
-        # Read σ_max directly from the discretizer config to avoid depending
-        # on `num_steps >= 2` just to index sigmas[0].
         sigma_max_scalar = float(getattr(self.discretization, "sigma_max", 1.0))
         sigma_max = mu.new_tensor(sigma_max_scalar)
 
         uc = default(uc, cond)
         s_in = mu.new_ones([mu.shape[0]])
         sigma = s_in * sigma_max
-
-        # FM initialisation: start from the cloudy image (t ≈ 0)
         x_init = mu.clone()
-
-        # s(σ_max) = 1 − σ_max = t_init  (very small, ≈ 0.001)
         st = self.sigma2st(sigma)
 
-        # Velocity prediction.  With the endpoint map  f = x + σ·v  a true
-        # 1-step prediction at σ = σ_max becomes  x_clean = μ + σ_max · v.
         v_pred = self._denoise(x_init, denoiser, sigma, cond, st, uc)
-
         sigma_bc = append_dims(sigma, x_init.ndim)
         x_clean = x_init + sigma_bc * v_pred
 
