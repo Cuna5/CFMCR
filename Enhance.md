@@ -114,12 +114,33 @@ sgm/models/diffusion.py
 | `start_pair_prob` | `0.35` |
 | `num_steps` | `40` |
 | `sampler.num_steps` | `1` |
+| `loss_type` | `"charbonnier"` |
+| `charbonnier_eps` | `1.0e-3` |
 
 ## 后续建议
 
 1. 跑 CUHK-CR1 的短训练，对比优化前后的 `final_PSNR`、`final_SSIM` 和 `final_RMSE`。
 2. 若 1 步指标仍偏低，优先测试 `sampler.num_steps=3`，确认多步 CFM 是否能追回细节。
 3. 后续所有画质优化都建议以 ablation 配置单独验证，避免把速度收益和指标收益混在一起解释。
+
+## 画质指标优化 — 已实装
+
+### 5. Charbonnier loss（替换 L2）
+
+L2 对大误差惩罚过重，导致输出偏模糊。Charbonnier `√(x²+ε²)` 是平滑 L1，对图像恢复任务普遍优于 L2。
+
+**改动文件：**
+
+- `sgm/modules/diffusionmodules/loss_cfm.py`：`_get_loss` 新增 `"charbonnier"` 分支；`__init__` 的 assert 同步放开，并新增可配置参数 `charbonnier_eps`。
+- `configs/example_training/cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml`：`loss_type` 从 `"l2"` 改为 `"charbonnier"`，`charbonnier_eps` 默认设为 `1.0e-3`。
+
+**核心公式：**
+
+$$\mathcal{L}_{charb}=\frac{1}{N}\sum\sqrt{(pred-target)^2+\varepsilon^2},\quad\varepsilon=10^{-3}$$
+
+**预期效果：** PSNR / SSIM 有机会小幅提升，输出细节更清晰；ε 越小越接近 L1，ε 越大则在小误差区域更平滑。
+
+---
 
 ## 可选画质性能优化方向
 
@@ -135,10 +156,24 @@ sgm/models/diffusion.py
 | 光谱一致性 loss | 改善多光谱真实性 | 在多波段输出上加入 per-band loss、band ratio consistency 或 SAM loss | SAM / ratio loss 对接近 0 的波段值敏感，需要 clamp 或 epsilon |
 | hard example / hard crop sampling | 提升厚云和复杂地表样本表现 | 提高厚云、云边界、纹理密集 crop 的采样概率 | 需要统计样本难度；采样过偏会影响整体分布 |
 | EMA decay 调度 | 改善 teacher 跟随速度 | 前期使用较低 decay（如 `0.999`），后期升到 `0.9999`；或固定试 `0.9995` | teacher 太快会不稳定，太慢会滞后；需要和 warmup 一起调 |
+| Charbonnier loss ✅ | 减少 L2 导致的模糊 | 已实装，见上方"已实装"章节 | 改动最小；ε 越小越接近 L1，默认 `1.0e-3` |
+| LPIPS 感知 loss | 改善视觉结构和 SSIM | 环境已有 `lpips==0.1.4`，在 `forward` 里对 `f_student` 和 `x_clean` 加 `lpips.LPIPS(net='alex')` 项，权重从 `0.01~0.05` 起试 | 需要 3 通道输入，多波段需先选 RGB 子集；权重过大会牺牲 PSNR |
+| DCT 频域 loss | 补偿高频细节和纹理 | 环境已有 `dctorch==0.1.2`，对 `f_student` 和 `x_clean` 做 `dct_2d` 后算 L2；可对高频系数额外加权 | 高频权重过大会放大噪声；建议先用均匀权重验证方向 |
+| 多尺度 endpoint loss | 稳定全局色彩同时保细节 | 对 `f_student` 和 `x_clean` 分别在 1×、0.5×、0.25× 分辨率下算 `clean_endpoint_loss`，低分辨率权重可略高 | 实现稍复杂；下采样方式（bilinear/area）影响结果，建议用 area |
+| Test-Time Augmentation（TTA） | 推理阶段零成本提升 PSNR | 推理时对输入做水平翻转、垂直翻转各预测一次，三次结果平均后输出；不改模型权重 | PSNR 通常涨 0.1~0.3 dB；推理时间变为 3×，需在论文中注明 |
+| 自适应 σ 采样 | 让模型更多训练难学的 σ 段 | 训练中统计各 σ 区间的平均 loss，按 loss 大小动态调整采样概率，替代固定的 `start_pair_prob` | 需要额外统计开销；采样过偏可能破坏整体分布，建议设置采样概率下界 |
 
 建议实验顺序：
 
-1. `SSIM endpoint loss`：先看 SSIM 是否稳定提升，以及 PSNR 是否可接受。
-2. 云区加权 loss：优先在有可靠 cloud mask 的数据集上做。
-3. endpoint fine-tuning：作为训练后期小学习率阶段，而不是从头训练就强行提高 endpoint 权重。
-4. `sampler.num_steps=2/3`：作为质量/速度折中结果加入对比表。
+1. `Charbonnier loss`：改动最小，先验证是否稳定提升 PSNR/SSIM，再叠加其他项。
+2. `LPIPS loss`：库已装，小权重叠加，主要改善 SSIM 和视觉结构。
+3. `SSIM endpoint loss`：先看 SSIM 是否稳定提升，以及 PSNR 是否可接受。
+4. `DCT 频域 loss`：库已装，补高频细节，与 Charbonnier 叠加效果互补。
+5. `TTA 推理`：零训练成本，可在任意阶段直接测试。
+6. 云区加权 loss：优先在有可靠 cloud mask 的数据集上做。
+7. endpoint fine-tuning：作为训练后期小学习率阶段，而不是从头训练就强行提高 endpoint 权重。
+8. `sampler.num_steps=2/3`：作为质量/速度折中结果加入对比表。
+9. 多尺度 loss、自适应 σ 采样：收益不确定，作为后期消融实验候选。
+
+## V1.3版本说明
+1. 利用Charbonnier loss代替L2作为惩罚函数的改进

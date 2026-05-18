@@ -8,6 +8,8 @@ model:
     use_ema: True
     use_flash_attn2: False
     image_metrics: "evaluator"
+    count_sample_time: True
+    count_train_time: True
     # ckpt_path: "" # your checkpoint path
 
     sigma_st_config:
@@ -114,29 +116,29 @@ data:
     train:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: True
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR2"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR2"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
 
 lightning:

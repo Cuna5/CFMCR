@@ -69,7 +69,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         discretization_config: Config for EDMDiscretization.  Use
             sigma_min=0.001, sigma_max=1.0, rho=1 for a linear schedule
             that matches uniform-t CFM training.
-        loss_type: "l2" (default) or "l1".
+        loss_type: "l2" (default), "l1", or "charbonnier".
         num_steps:  Number of discretisation steps used to build the σ
             schedule from which consecutive pairs (σ_n, σ_{n+1}) are sampled.
         endpoint_loss_weight: Weight for the endpoint consistency term
@@ -85,6 +85,9 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         start_pair_prob: Probability of replacing the sampled pair with the
             first pair at σ_max. This gives more updates to the state used by
             true 1-step inference (x=μ, σ≈1).
+        charbonnier_eps: Epsilon for Charbonnier loss
+            sqrt((pred-target)^2 + eps^2). Used only when
+            loss_type="charbonnier".
         batch2model_keys: Keys forwarded from batch to the network.
     """
 
@@ -98,11 +101,12 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         consistency_loss_weight: float = 1.0,
         clean_endpoint_loss_weight: float = 1.0,
         start_pair_prob: float = 0.25,
+        charbonnier_eps: float = 1e-3,
         consistency_warmup_steps: int = 0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__()
-        assert loss_type in ["l2", "l1"], f"Unsupported loss_type: {loss_type}"
+        assert loss_type in ["l2", "l1", "charbonnier"], f"Unsupported loss_type: {loss_type}"
         assert num_steps >= 2, "ConsistencyFlowMatchingLoss requires num_steps >= 2"
 
         self.discretization = instantiate_from_config(discretization_config)
@@ -113,6 +117,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.consistency_loss_weight = consistency_loss_weight
         self.clean_endpoint_loss_weight = clean_endpoint_loss_weight
         self.start_pair_prob = min(max(float(start_pair_prob), 0.0), 1.0)
+        self.charbonnier_eps = max(float(charbonnier_eps), 1e-12)
         # While training from scratch the teacher is random for the first
         # few thousand steps. Linearly ramp the endpoint/velocity consistency
         # terms up from 0 so those steps are guided only by the supervised
@@ -254,6 +259,12 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         elif self.loss_type == "l1":
             return torch.mean(
                 (pred - target).abs().reshape(pred.shape[0], -1), dim=1
+            )
+        elif self.loss_type == "charbonnier":
+            diff = (pred - target).float()
+            eps_sq = diff.new_tensor(self.charbonnier_eps ** 2)
+            return torch.mean(
+                torch.sqrt(diff ** 2 + eps_sq).reshape(pred.shape[0], -1), dim=1
             )
         else:
             raise NotImplementedError(f"Unknown loss_type: {self.loss_type}")

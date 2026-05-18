@@ -88,6 +88,8 @@ model.params.sampler_config.params.num_steps=3
 |----------|--------|------|
 | `model.base_learning_rate` | `1e-4` | CFM 从零训练初始学习率 |
 | `model.params.teacher_ema_decay` | `0.9999` | EMA teacher 衰减率 |
+| `model.params.loss_fn_config.params.loss_type` | `"charbonnier"` | 默认使用 Charbonnier endpoint / velocity 损失 |
+| `model.params.loss_fn_config.params.charbonnier_eps` | `1.0e-3` | Charbonnier 平滑项 ε，公式为 `sqrt(diff^2 + ε^2)` |
 | `model.params.loss_fn_config.params.velocity_anchor_loss_weight` | `1.0` | 速度锚点损失，约束 `vθ ≈ x_clean - μ` |
 | `model.params.loss_fn_config.params.clean_endpoint_loss_weight` | `1.0` | clean endpoint 监督，优先服务画质指标 |
 | `model.params.loss_fn_config.params.start_pair_prob` | `0.35` | 起点段过采样概率 |
