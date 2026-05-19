@@ -24,6 +24,8 @@ model:
     use_flash_attn2: False
     image_metrics: "evaluator"
     teacher_ema_decay: 0.9999       # EMA decay for the CFM teacher model
+    count_sample_time: True
+    count_train_time: True
 
     # Optional: warm-start from a CFM checkpoint.
     # ckpt_path: "/path/to/cfm_pretrained.ckpt"
@@ -77,7 +79,8 @@ model:
     loss_fn_config:
       target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
       params:
-        loss_type: "l2"
+        loss_type: "charbonnier"
+        charbonnier_eps: 1.0e-3
         endpoint_loss_weight: 0.5    # teacher endpoint consistency
         consistency_loss_weight: 0.5 # teacher velocity consistency
         velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
@@ -134,29 +137,29 @@ data:
     train:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR1"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR1"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: True
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR1"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR1"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR1"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR1"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
-        datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/CUHK-CR1"
-        nir_datasets_dir: "/remote-home/share/dmb_nas/liuyi/C-CUHK/nir/CUHK-CR1"
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
+        nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
 
 lightning:

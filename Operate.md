@@ -14,22 +14,11 @@
 CFM 可以从零开始训练，不需要预训练 checkpoint：
 
 ```bash
-python main.py \
-    --base configs/example_training/cuhk_cfm.yaml \
-    --train \
-    --devices 0,1 \
-    lightning.trainer.max_epochs=500
+python main.py --base configs/example_training/cuhk_cfm.yaml --train --enable_tf32
 ```
 
 CUHK-CR2：
 
-```bash
-python main.py \
-    --base configs/example_training/cuhkv2_cfm.yaml \
-    --train \
-    --devices 0,1 \
-    lightning.trainer.max_epochs=2000
-```
 ```bash
 python main.py --base configs/example_training/cuhkv2_cfm.yaml --enable_tf32
 ```
@@ -45,20 +34,22 @@ ckpt_path: "/path/to/cfm_pretrained.ckpt"
 
 ```bash
 python main.py \
-    --base configs/example_training/cuhk_cfm.yaml \
+    --base configs/example_training/cuhkv2_cfm.yaml \
     --test \
     --devices 0, \
-    model.params.ckpt_path="/path/to/cfm_model.ckpt"
+    model.params.ckpt_path="/path/to/cfm_model.ckpt"\
+    -t false
 ```
 
 逐张预测并保存结果：
 
 ```bash
 python main.py \
-    --base configs/example_training/cuhk_cfm.yaml \
+    --base configs/example_training/cuhkv2_cfm.yaml \
     --predict \
     --devices 0, \
-    model.params.ckpt_path="/path/to/cfm_model.ckpt"
+    model.params.ckpt_path="/path/to/cfm_model.ckpt"\
+    -t false
 ```
 
 结果保存在 `logs/<experiment>/sample/`，包含 PNG、GeoTIFF 和 `metrics.csv`。`metrics.csv` 会记录每张图像的 PSNR / SSIM / RMSE 等指标。
@@ -88,6 +79,8 @@ model.params.sampler_config.params.num_steps=3
 |----------|--------|------|
 | `model.base_learning_rate` | `1e-4` | CFM 从零训练初始学习率 |
 | `model.params.teacher_ema_decay` | `0.9999` | EMA teacher 衰减率 |
+| `model.params.loss_fn_config.params.loss_type` | `"charbonnier"` | 默认使用 Charbonnier endpoint / velocity 损失 |
+| `model.params.loss_fn_config.params.charbonnier_eps` | `1.0e-3` | Charbonnier 平滑项 ε，公式为 `sqrt(diff^2 + ε^2)` |
 | `model.params.loss_fn_config.params.velocity_anchor_loss_weight` | `1.0` | 速度锚点损失，约束 `vθ ≈ x_clean - μ` |
 | `model.params.loss_fn_config.params.clean_endpoint_loss_weight` | `1.0` | clean endpoint 监督，优先服务画质指标 |
 | `model.params.loss_fn_config.params.start_pair_prob` | `0.35` | 起点段过采样概率 |

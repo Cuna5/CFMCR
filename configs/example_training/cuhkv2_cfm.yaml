@@ -70,7 +70,8 @@ model:
     loss_fn_config:
       target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
       params:
-        loss_type: "l2"
+        loss_type: "charbonnier"
+        charbonnier_eps: 1.0e-3
         endpoint_loss_weight: 0.5    # teacher endpoint consistency
         consistency_loss_weight: 0.5 # teacher velocity consistency
         velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
@@ -90,7 +91,7 @@ model:
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling_cfm.ConsistencyFlowMatchingSampler
       params:
-        num_steps: 3
+        num_steps: 1 # 4/7/10
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
@@ -114,7 +115,7 @@ model:
 data:
   target: sgm.data.base.DataModuleFromConfig
   params:
-    batch_size: 1
+    batch_size: 2
     num_workers: 8
     wrap: True
     train:
