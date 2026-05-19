@@ -14,22 +14,11 @@
 CFM 可以从零开始训练，不需要预训练 checkpoint：
 
 ```bash
-python main.py \
-    --base configs/example_training/cuhk_cfm.yaml \
-    --train \
-    --devices 0,1 \
-    lightning.trainer.max_epochs=500
+python main.py --base configs/example_training/cuhk_cfm.yaml --train --enable_tf32
 ```
 
 CUHK-CR2：
 
-```bash
-python main.py \
-    --base configs/example_training/cuhkv2_cfm.yaml \
-    --train \
-    --devices 0,1 \
-    lightning.trainer.max_epochs=2000
-```
 ```bash
 python main.py --base configs/example_training/cuhkv2_cfm.yaml --enable_tf32
 ```
@@ -45,20 +34,22 @@ ckpt_path: "/path/to/cfm_pretrained.ckpt"
 
 ```bash
 python main.py \
-    --base configs/example_training/cuhk_cfm.yaml \
+    --base configs/example_training/cuhkv2_cfm.yaml \
     --test \
     --devices 0, \
-    model.params.ckpt_path="/path/to/cfm_model.ckpt"
+    model.params.ckpt_path="/path/to/cfm_model.ckpt"\
+    -t false
 ```
 
 逐张预测并保存结果：
 
 ```bash
 python main.py \
-    --base configs/example_training/cuhk_cfm.yaml \
+    --base configs/example_training/cuhkv2_cfm.yaml \
     --predict \
     --devices 0, \
-    model.params.ckpt_path="/path/to/cfm_model.ckpt"
+    model.params.ckpt_path="/path/to/cfm_model.ckpt"\
+    -t false
 ```
 
 结果保存在 `logs/<experiment>/sample/`，包含 PNG、GeoTIFF 和 `metrics.csv`。`metrics.csv` 会记录每张图像的 PSNR / SSIM / RMSE 等指标。
