@@ -10,23 +10,76 @@ The default path is true 1-step inference:
 When ``num_steps > 1`` the same trained CFM velocity field is integrated with
 Euler steps in sigma space, which provides a quality/speed tradeoff without
 requiring a separate sampler module.
+
+Test-Time Augmentation (TTA)
+----------------------------
+When ``tta=True``, four geometric variants are evaluated and averaged:
+
+    1. original
+    2. horizontal flip
+    3. vertical flip
+    4. horizontal + vertical flip (180° rotation)
+
+Each variant is inverse-transformed before averaging, yielding more robust
+predictions at the cost of 4× inference time.  Enable via YAML:
+
+    sampler_config.params.tta: True
 """
 
-from typing import Dict, Union
+from typing import Dict, List, Union
 
+import torch
 from omegaconf import ListConfig
 
 from ...util import append_dims, default, instantiate_from_config, tools_scale
 
 
+# ---------------------------------------------------------------------------
+# TTA geometric transforms (operate on BCHW tensors)
+# ---------------------------------------------------------------------------
+
+def _hflip(x: torch.Tensor) -> torch.Tensor:
+    """Horizontal flip (left-right)."""
+    return x.flip(-1)
+
+
+def _vflip(x: torch.Tensor) -> torch.Tensor:
+    """Vertical flip (top-bottom)."""
+    return x.flip(-2)
+
+
+def _hvflip(x: torch.Tensor) -> torch.Tensor:
+    """Horizontal + vertical flip (equivalent to 180° rotation)."""
+    return x.flip(-1).flip(-2)
+
+
+# Each entry: (forward_transform, inverse_transform)
+_TTA_TRANSFORMS: List = [
+    (lambda x: x,      lambda x: x),       # identity
+    (_hflip,            _hflip),            # hflip is self-inverse
+    (_vflip,            _vflip),            # vflip is self-inverse
+    (_hvflip,           _hvflip),           # hvflip is self-inverse
+]
+
+
 class ConsistencyFlowMatchingSampler:
-    """Sampler for CFM cloud removal models."""
+    """Sampler for CFM cloud removal models.
+
+    Args:
+        discretization_config: Discretization schedule config.
+        num_steps: Number of sampling steps (1 = true one-step inference).
+        guider_config: Optional classifier-free guidance config.
+        tta: Enable Test-Time Augmentation (4 geometric variants averaged).
+        verbose: Print progress bar during multi-step sampling.
+        device: Device string.
+    """
 
     def __init__(
         self,
         discretization_config: Union[Dict, ListConfig],
         num_steps: Union[int, None] = None,
         guider_config: Union[Dict, ListConfig, None] = None,
+        tta: bool = False,
         verbose: bool = False,
         device: str = "cuda",
     ):
@@ -37,6 +90,7 @@ class ConsistencyFlowMatchingSampler:
             "target": "sgm.modules.diffusionmodules.guiders.IdentityGuider"
         }
         self.guider = instantiate_from_config(default(guider_config, default_guider))
+        self.tta = tta
         self.verbose = verbose
         self.device = device
         self.sigma2st = None
@@ -75,6 +129,56 @@ class ConsistencyFlowMatchingSampler:
         x_next = x - v_pred * dt
         return x_next, endpoint
 
+    # ------------------------------------------------------------------
+    # TTA helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_transform_to_cond(cond, transform_fn):
+        """Apply a spatial transform to all 4-D tensors in a cond dict.
+
+        Conditioner outputs that carry spatial information (e.g. the
+        concatenated cloudy image) must be transformed in sync with mu.
+        Scalar / 1-D / 2-D embeddings are left untouched.
+        """
+        transformed = {}
+        for k, v in cond.items():
+            if isinstance(v, torch.Tensor) and v.ndim == 4:
+                transformed[k] = transform_fn(v)
+            else:
+                transformed[k] = v
+        return transformed
+
+    def _sample_single(self, denoiser, x, mu, cond, uc, num_steps):
+        """Run core sampling (1-step or multi-step) without TTA, returning
+        only x_clean (no intermediates/denoiseds — those are not meaningful
+        when averaged across transforms)."""
+        n = self.num_steps if num_steps is None else num_steps
+        if n == 1:
+            x_clean, _ = self._one_step(denoiser, x, mu, cond, uc)
+        else:
+            x_clean, _ = self._multi_step(denoiser, x, mu, cond, uc, num_steps)
+        return x_clean
+
+    def _sample_with_tta(self, denoiser, x, mu, cond, uc, num_steps):
+        """Run inference with 4 geometric augmentations and average."""
+        accumulator = torch.zeros_like(mu)
+
+        for fwd_fn, inv_fn in _TTA_TRANSFORMS:
+            mu_t = fwd_fn(mu)
+            cond_t = self._apply_transform_to_cond(cond, fwd_fn)
+            uc_t = self._apply_transform_to_cond(uc, fwd_fn) if uc is not None else None
+
+            x_clean_t = self._sample_single(denoiser, x, mu_t, cond_t, uc_t, num_steps)
+            accumulator += inv_fn(x_clean_t)
+
+        x_clean_avg = accumulator / len(_TTA_TRANSFORMS)
+        return x_clean_avg
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
     def __call__(
         self,
         denoiser,
@@ -86,6 +190,14 @@ class ConsistencyFlowMatchingSampler:
         return_intermediate: bool = False,
         return_denoised: bool = False,
     ):
+        # TTA path — averages across geometric transforms
+        if self.tta:
+            x_clean = self._sample_with_tta(denoiser, x, mu, cond, uc, num_steps)
+            # TTA does not produce meaningful intermediates/denoiseds
+            others = {}
+            return x_clean, others
+
+        # Non-TTA path — preserves intermediates/denoiseds
         n = self.num_steps if num_steps is None else num_steps
         if n == 1:
             return self._one_step(

@@ -11,8 +11,22 @@ import skimage.io as io
 
 class TrainDataset(data.Dataset):
 
-    def __init__(self, datasets_dir, nir_datasets_dir=None, isTrain=True):
+    def __init__(
+        self,
+        datasets_dir,
+        nir_datasets_dir=None,
+        isTrain=True,
+        augment=False,
+        hflip_p=0.5,
+        vflip_p=0.5,
+        rot90_p=0.5,
+    ):
         super().__init__()
+        self.isTrain = isTrain
+        self.augment = augment and isTrain
+        self.hflip_p = float(hflip_p)
+        self.vflip_p = float(vflip_p)
+        self.rot90_p = float(rot90_p)
         if(isTrain):
             self.datasets_dir = datasets_dir+'/train' #change to the path of your dataset
         else:
@@ -27,6 +41,22 @@ class TrainDataset(data.Dataset):
         self.nir_imlistl = sorted(os.listdir(os.path.join(self.nir_datasets_dir, 'label'))) if nir_datasets_dir is not None else None
         assert len(self.imlistl) == len(self.nir_imlistl), 'The number of images in the RGB dataset and NIR dataset should be the same'
 
+    def _augment_pair(self, t, x):
+        if np.random.rand() < self.hflip_p:
+            t = np.flip(t, axis=1)
+            x = np.flip(x, axis=1)
+
+        if np.random.rand() < self.vflip_p:
+            t = np.flip(t, axis=0)
+            x = np.flip(x, axis=0)
+
+        if np.random.rand() < self.rot90_p:
+            k = np.random.randint(1, 4)
+            t = np.rot90(t, k, axes=(0, 1))
+            x = np.rot90(x, k, axes=(0, 1))
+
+        return np.ascontiguousarray(t), np.ascontiguousarray(x)
+
     def __getitem__(self, index):
         # a dataset contain 4 bands. it read the nir band and RGB band separately
         t = io.imread(os.path.join(self.datasets_dir, 'label', str(self.imlistl[index]))).astype(np.float32)
@@ -38,6 +68,9 @@ class TrainDataset(data.Dataset):
             x =np.concatenate([x,nirx[:,:,np.newaxis]],axis=2)
         t = imresize(t, 1/2)
         x = imresize(x, 1/2)
+
+        if self.augment:
+            t, x = self._augment_pair(t, x)
 
         M = np.clip((t-x).sum(axis=2), 0, 1).astype(np.float32)
         #M = io.imread(os.path.join(self.datasets_dir, 'mask', str(self.imlistl[index]))).astype(np.float32)

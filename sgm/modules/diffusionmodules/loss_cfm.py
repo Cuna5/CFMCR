@@ -48,6 +48,7 @@ as the second positional argument).
 
 from typing import Dict, List, Optional, Union
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 
 from ...util import append_dims, instantiate_from_config
@@ -88,6 +89,13 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         charbonnier_eps: Epsilon for Charbonnier loss
             sqrt((pred-target)^2 + eps^2). Used only when
             loss_type="charbonnier".
+        cloud_mask_key: Batch key for the cloud mask used by cloud-weighted
+            supervised losses. Set cloud_loss_weight<=1 to disable.
+        cloud_loss_weight: Pixel weight applied on cloud regions. The weight
+            map is normalized per sample, so the average loss scale stays
+            close to the unweighted setting.
+        cloud_weight_velocity_anchor: Also apply cloud weighting to the
+            supervised velocity anchor term.
         batch2model_keys: Keys forwarded from batch to the network.
     """
 
@@ -102,6 +110,9 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         clean_endpoint_loss_weight: float = 1.0,
         start_pair_prob: float = 0.25,
         charbonnier_eps: float = 1e-3,
+        cloud_mask_key: str = "M",
+        cloud_loss_weight: float = 1.0,
+        cloud_weight_velocity_anchor: bool = False,
         consistency_warmup_steps: int = 0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
@@ -118,6 +129,9 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.clean_endpoint_loss_weight = clean_endpoint_loss_weight
         self.start_pair_prob = min(max(float(start_pair_prob), 0.0), 1.0)
         self.charbonnier_eps = max(float(charbonnier_eps), 1e-12)
+        self.cloud_mask_key = cloud_mask_key
+        self.cloud_loss_weight = max(float(cloud_loss_weight), 1.0)
+        self.cloud_weight_velocity_anchor = bool(cloud_weight_velocity_anchor)
         # While training from scratch the teacher is random for the first
         # few thousand steps. Linearly ramp the endpoint/velocity consistency
         # terms up from 0 so those steps are guided only by the supervised
@@ -136,6 +150,44 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             return 1.0
         step = int(batch.get("global_step", 0))
         return min(1.0, step / float(self.consistency_warmup_steps))
+
+    def _get_cloud_weight(
+        self, batch: Dict, input: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if self.cloud_loss_weight <= 1.0 or self.cloud_mask_key not in batch:
+            return None
+
+        mask = batch[self.cloud_mask_key]
+        if torch.is_tensor(mask):
+            mask = mask.to(device=input.device, dtype=input.dtype)
+        else:
+            mask = torch.as_tensor(mask, device=input.device, dtype=input.dtype)
+
+        if mask.ndim == input.ndim - 1:
+            mask = mask.unsqueeze(1)
+        elif mask.ndim == input.ndim:
+            if mask.shape[1] != 1:
+                mask = mask.max(dim=1, keepdim=True).values
+        else:
+            raise ValueError(
+                f"Cloud mask '{self.cloud_mask_key}' has shape {tuple(mask.shape)}, "
+                f"expected [B,H,W] or [B,1,H,W] for input {tuple(input.shape)}"
+            )
+
+        if mask.shape[0] != input.shape[0]:
+            raise ValueError(
+                f"Cloud mask batch size {mask.shape[0]} does not match input "
+                f"batch size {input.shape[0]}"
+            )
+        if mask.shape[-2:] != input.shape[-2:]:
+            mask = F.interpolate(mask, size=input.shape[-2:], mode="nearest")
+
+        mask = mask.clamp(0.0, 1.0)
+        weight = 1.0 + (self.cloud_loss_weight - 1.0) * mask
+        norm = weight.flatten(1).mean(dim=1).view(
+            -1, *([1] * (input.ndim - 1))
+        )
+        return weight / norm.clamp_min(1e-6)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -232,10 +284,16 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         velocity_target = input - mu
 
         # ── 7. Combined CFM loss ───────────────────────────────────────────
+        cloud_weight = self._get_cloud_weight(batch, input)
+        velocity_anchor_weight = (
+            cloud_weight if self.cloud_weight_velocity_anchor else None
+        )
         endpoint_loss = self._get_loss(f_student, f_target.detach())
         velocity_consistency_loss = self._get_loss(v_student, v_target)
-        velocity_anchor_loss = self._get_loss(v_student, velocity_target)
-        clean_endpoint_loss = self._get_loss(f_student, input)
+        velocity_anchor_loss = self._get_loss(
+            v_student, velocity_target, velocity_anchor_weight
+        )
+        clean_endpoint_loss = self._get_loss(f_student, input, cloud_weight)
 
         # Warmup: disable the consistency / endpoint terms during the first
         # `consistency_warmup_steps` gradient updates so the student+teacher
@@ -250,21 +308,22 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         )
 
     def _get_loss(
-        self, pred: torch.Tensor, target: torch.Tensor
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        pixel_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.loss_type == "l2":
-            return torch.mean(
-                ((pred - target) ** 2).reshape(pred.shape[0], -1), dim=1
-            )
+            loss = (pred - target) ** 2
         elif self.loss_type == "l1":
-            return torch.mean(
-                (pred - target).abs().reshape(pred.shape[0], -1), dim=1
-            )
+            loss = (pred - target).abs()
         elif self.loss_type == "charbonnier":
             diff = (pred - target).float()
             eps_sq = diff.new_tensor(self.charbonnier_eps ** 2)
-            return torch.mean(
-                torch.sqrt(diff ** 2 + eps_sq).reshape(pred.shape[0], -1), dim=1
-            )
+            loss = torch.sqrt(diff ** 2 + eps_sq)
         else:
             raise NotImplementedError(f"Unknown loss_type: {self.loss_type}")
+
+        if pixel_weight is not None:
+            loss = loss * pixel_weight
+        return torch.mean(loss.reshape(pred.shape[0], -1), dim=1)

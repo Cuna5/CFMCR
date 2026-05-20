@@ -85,6 +85,9 @@ model:
         consistency_loss_weight: 0.5 # teacher velocity consistency
         velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
         clean_endpoint_loss_weight: 1.0  # direct fθ -> x_clean metric anchor
+        cloud_mask_key: "M"              # CUHK dataloader cloud mask
+        cloud_loss_weight: 2.0           # cloud pixels are weighted 2x, then normalized per sample
+        cloud_weight_velocity_anchor: True
         start_pair_prob: 0.35            # oversample σ≈1 for 1-step quality
         # Two-stage training (Yang et al. 2024, Sec. 4.2): the endpoint /
         # velocity consistency terms are linearly ramped up from 0 over the
@@ -107,6 +110,10 @@ model:
       params:
         # Set num_steps=1 for true 1-step inference; >1 uses CFM Euler steps.
         num_steps: 1
+        # Test-Time Augmentation: average 4 geometric variants (orig + hflip
+        # + vflip + hvflip).  Typically +0.1~0.3 dB PSNR at 4× inference cost.
+        # Enable via CLI: model.params.sampler_config.params.tta=True
+        tta: False
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
@@ -140,6 +147,10 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: True
+        augment: True
+        hflip_p: 0.5
+        vflip_p: 0.5
+        rot90_p: 0.5
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
