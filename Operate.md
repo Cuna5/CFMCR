@@ -73,6 +73,20 @@ model.params.sampler_config.params.num_steps=3
 
 这会使用 CFM 采样器内置的 Euler 多步路径，通常能换取更好的 PSNR / SSIM，但推理耗时会随步数增加。
 
+### Test-Time Augmentation（TTA）
+
+TTA 通过对输入做 4 种几何变换（原图、水平翻转、垂直翻转、180° 旋转），分别推理后逆变换取平均，可获得 +0.1~0.3 dB PSNR 提升，推理时间变为 4 倍，不需要重新训练。
+
+开启 TTA：
+
+```bash
+python main.py --base configs/example_training/cuhk_cfm.yaml \
+    -t false \
+    model.params.sampler_config.params.tta=True
+```
+
+TTA 可与多步采样叠加使用（推理时间为 4×num_steps）。建议仅在 test / predict 时开启，训练 validation 保持关闭。
+
 ## 关键参数
 
 | 参数路径 | 默认值 | 说明 |
@@ -86,6 +100,7 @@ model.params.sampler_config.params.num_steps=3
 | `model.params.loss_fn_config.params.start_pair_prob` | `0.35` | 起点段过采样概率 |
 | `model.params.loss_fn_config.params.consistency_warmup_steps` | `2000` | 前期线性引入 teacher 一致性项 |
 | `model.params.sampler_config.params.num_steps` | `1` | 推理步数；设为 `3` 或 `4` 可做质量/速度折中 |
+| `model.params.sampler_config.params.tta` | `False` | Test-Time Augmentation；设为 `True` 可提升 +0.1~0.3 dB PSNR |
 
 ## 数据集路径
 
