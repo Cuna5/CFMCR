@@ -110,7 +110,7 @@ model:
 data:
   target: sgm.data.base.DataModuleFromConfig
   params:
-    batch_size: 1 # 2
+    batch_size: 4 # 2
     num_workers: 8
     wrap: True
     train:

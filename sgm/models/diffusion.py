@@ -597,10 +597,10 @@ class ResidualDiffusionEngine(DiffusionEngine):
                 )
             samples = self.decode_first_stage(samples)
             log["samples"] = self.to_rgb_func(samples)
-            if return_intermediate:
+            if return_intermediate and 'intermediates' in others:
                 log["intermediate"] = self._get_denoise_row_from_list(others['intermediates'], to_rgb_func=self.to_rgb_func) * 2.0 - 1.0
-                
-            if return_denoised:
+
+            if return_denoised and 'denoiseds' in others:
                 log["denoised"] = self._get_denoise_row_from_list(others['denoiseds'], to_rgb_func=self.to_rgb_func) * 2.0 - 1.0
         
         # if return_ideal_samples:
@@ -916,10 +916,10 @@ class TemporalResidualDiffusionEngine(ResidualDiffusionEngine):
                 samples = self.decode_first_stage(samples)
             log["samples"] = self.to_rgb_func(self.scale_01(samples) * 2.0 - 1.0)
             # log['samples'] = self.to_rgb_func(samples)
-            if return_intermediate:
+            if return_intermediate and 'intermediates' in others:
                 log["intermediate"] = self._get_temporal_denoise_row_from_list(others['intermediates'], to_rgb_func=self.to_rgb_func) * 2.0 - 1.0
-                
-            if return_denoised:
+
+            if return_denoised and 'denoiseds' in others:
                 log["denoised"] = self._get_denoise_row_from_list(others['denoiseds'], to_rgb_func=self.to_rgb_func) * 2.0 - 1.0
             
             if return_attn:

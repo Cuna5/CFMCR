@@ -357,21 +357,29 @@ python main.py --base configs/example_training/cuhk_cfm.yaml \
 3. 然后对已实装的 CUHK 成对数据增强做短训消融，确认收益后再扩展到 Sen2_MTC_New / Sentinel 多时相场景。
 4. 最后补 smoke tests 和可配置缓存目录，降低后续继续叠加 CFM loss 等优化时的回归成本。
 
-## V1.3版本说明
-1. 加入数据增强（水平垂直翻转/90度旋转）相关优化。
-   - `sgm/data/cuhk/image_datasets.py` 新增 `augment`、`hflip_p`、`vflip_p`、`rot90_p` 配置项。
-   - `_augment_pair()` 对 `label` 和 `cloud` 同步执行水平翻转、垂直翻转和 90 度整数倍旋转。
-   - 增强发生在 resize 之后、`M` mask 计算之前，避免监督图、条件图和 mask 错位。
-   - `configs/example_training/cuhk_cfm.yaml` 与 `cuhkv2_cfm.yaml` 仅在 `train` 数据集开启增强，验证、测试和预测保持确定性输入。
-2. 加入云区加权 loss。
-   - `sgm/modules/diffusionmodules/loss_cfm.py` 新增 `cloud_mask_key`、`cloud_loss_weight`、`cloud_weight_velocity_anchor` 配置项。
-   - 默认从 batch 的 `M` 读取云区 mask，支持 `[B,H,W]` 和 `[B,1,H,W]`，尺寸不一致时用 nearest 插值对齐到训练图大小。
-   - 权重公式为 `1 + (cloud_loss_weight - 1) * M`，并按样本均值归一化，避免云比例改变整体 loss 尺度。
-   - 当前对 `clean_endpoint_loss` 启用云区加权，并通过 `cloud_weight_velocity_anchor: True` 同步加权速度锚点；teacher endpoint / velocity consistency 仍保持原权重，避免放大早期 teacher 噪声。
-   - `configs/example_training/cuhk_cfm.yaml` 与 `cuhkv2_cfm.yaml` 默认启用 `cloud_loss_weight: 2.0`，后续建议短训扫描 `1.5/2.0/3.0`。
-3. 加入 Test-Time Augmentation（TTA）推理。
-   - `sgm/modules/diffusionmodules/sampling_cfm.py` 新增 `tta` 构造参数（默认 `False`），及 `_apply_transform_to_cond()`、`_sample_single()`、`_sample_with_tta()` 三个方法。
-   - 启用 TTA 时，采样器对输入执行 4 种几何变换（原图、水平翻转、垂直翻转、水平+垂直翻转），分别推理后逆变换并取平均。对 `mu` 和所有 4-D cond 张量同步变换，保证空间一致性。
-   - `configs/example_training/cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml` 的 `sampler_config.params` 新增 `tta: False`，可通过 YAML 修改或 CLI 覆盖 `model.params.sampler_config.params.tta=True` 启用。
-   - 预期提升 +0.1~0.3 dB PSNR，推理时间变为 4 倍，不需要重新训练。
-   - TTA 模式不返回 `intermediates` / `denoiseds`，建议仅在 test / predict 阶段开启。
+## V1.4版本说明
+1. 修正TTA推理会发生报错的BUG。
+2. CFM 多步推理引入 EMRDM 式随机扰动（s_churn）
+在 `ConsistencyFlowMatchingSampler` 的多步 Euler 积分中，借鉴 EMRDM `ResidualEDMSampler` 的 `s_churn` 机制，在每步前对当前状态注入随机噪声：
+
+$$\hat{\sigma}_i = \sigma_i (1 + \gamma), \quad \gamma = \min\!\left(\frac{s\_churn}{N-1},\ \sqrt{2}-1\right)$$
+
+$$\hat{x} = x + \sqrt{\hat{\sigma}_i^2 - \sigma_i^2}\cdot s\_noise \cdot \varepsilon, \quad \varepsilon \sim \mathcal{N}(0,I)$$
+
+扰动后以 $\hat{\sigma}_i$ 替代 $\sigma_i$ 做 Euler 步，其余流程不变。
+
+**新增参数**（均可在 YAML `sampler_config.params` 中配置）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `s_churn` | `0.0` | 扰动强度，0 表示关闭（退化为原确定性 ODE） |
+| `s_tmin` | `0.0` | 只在 `sigma >= s_tmin` 的步骤加扰动 |
+| `s_tmax` | `inf` | 只在 `sigma <= s_tmax` 的步骤加扰动 |
+| `s_noise` | `1.0` | 噪声幅度缩放 |
+
+**注意：**
+- 仅对多步推理（`num_steps > 1`）生效；1 步推理路径不受影响。
+- TTA 在 `num_steps > 1` 时会调用 `_multi_step`，因此可与 s_churn 叠加；默认 `num_steps=1` 时仍是确定性一步路径，不触发扰动。
+- `sigma_hat` 会被限制在采样时间表的最大 `sigma` 内，避免首步从 `sigma=1.0` 扰动到训练范围外。
+- 建议先在 `num_steps=4~8` 下扫 `s_churn=0.1~0.5`，观察 PSNR/SSIM 变化。
+3. 优化相关参数说明。
