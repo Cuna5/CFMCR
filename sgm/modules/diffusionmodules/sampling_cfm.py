@@ -82,6 +82,10 @@ class ConsistencyFlowMatchingSampler:
         tta: bool = False,
         verbose: bool = False,
         device: str = "cuda",
+        s_churn: float = 0.0,
+        s_tmin: float = 0.0,
+        s_tmax: float = float("inf"),
+        s_noise: float = 1.0,
     ):
         self.num_steps = num_steps
         self.discretization = instantiate_from_config(discretization_config)
@@ -94,6 +98,10 @@ class ConsistencyFlowMatchingSampler:
         self.verbose = verbose
         self.device = device
         self.sigma2st = None
+        self.s_churn = s_churn
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
 
     def set_sigma2st(self, sigma2st):
         self.sigma2st = sigma2st
@@ -229,8 +237,19 @@ class ConsistencyFlowMatchingSampler:
             if return_intermediate:
                 intermediates.append(tools_scale(x.clone().detach()))
 
+            sigma_i = s_in * sigmas[i]
+            # s_churn stochastic perturbation (mirrors EMRDM ResidualEDMSampler)
+            if self.s_churn > 0.0 and self.s_tmin <= float(sigmas[i]) <= self.s_tmax:
+                gamma = min(self.s_churn / (num_sigmas - 1), 2 ** 0.5 - 1)
+                sigma_max = s_in * sigmas[0]
+                sigma_hat = torch.minimum(sigma_i * (1.0 + gamma), sigma_max)
+                noise = torch.randn_like(x) * self.s_noise
+                noise_scale = torch.sqrt((sigma_hat ** 2 - sigma_i ** 2).clamp_min(0.0))
+                x = x + append_dims(noise_scale, x.ndim) * noise
+                sigma_i = sigma_hat
+
             x, endpoint = self._sampler_step(
-                s_in * sigmas[i],
+                sigma_i,
                 s_in * sigmas[i + 1],
                 denoiser,
                 x,

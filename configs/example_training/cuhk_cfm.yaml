@@ -114,6 +114,12 @@ model:
         # + vflip + hvflip).  Typically +0.1~0.3 dB PSNR at 4× inference cost.
         # Enable via CLI: model.params.sampler_config.params.tta=True
         tta: False
+        # Stochastic churn for multi-step CFM sampling only (num_steps > 1).
+        # sigma_hat is clamped to sigma_max to avoid leaving the trained range.
+        s_churn: 0.0
+        s_tmin: 0.0
+        s_tmax: 100000000.0
+        s_noise: 1.0
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
