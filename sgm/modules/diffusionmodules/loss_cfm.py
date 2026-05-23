@@ -96,6 +96,9 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             close to the unweighted setting.
         cloud_weight_velocity_anchor: Also apply cloud weighting to the
             supervised velocity anchor term.
+        non_cloud_identity_loss_weight: Weight for the non-cloud identity loss
+            MSE((1-M)*f_student, (1-M)*x_cloudy). Penalises changes to already
+            clear pixels, which directly improves whole-image PSNR.
         batch2model_keys: Keys forwarded from batch to the network.
     """
 
@@ -114,6 +117,8 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         cloud_loss_weight: float = 1.0,
         cloud_weight_velocity_anchor: bool = False,
         consistency_warmup_steps: int = 0,
+        ssim_endpoint_loss_weight: float = 0.0,
+        non_cloud_identity_loss_weight: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__()
@@ -132,6 +137,8 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.cloud_mask_key = cloud_mask_key
         self.cloud_loss_weight = max(float(cloud_loss_weight), 1.0)
         self.cloud_weight_velocity_anchor = bool(cloud_weight_velocity_anchor)
+        self.ssim_endpoint_loss_weight = float(ssim_endpoint_loss_weight)
+        self.non_cloud_identity_loss_weight = float(non_cloud_identity_loss_weight)
         # While training from scratch the teacher is random for the first
         # few thousand steps. Linearly ramp the endpoint/velocity consistency
         # terms up from 0 so those steps are guided only by the supervised
@@ -151,18 +158,17 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         step = int(batch.get("global_step", 0))
         return min(1.0, step / float(self.consistency_warmup_steps))
 
-    def _get_cloud_weight(
+    def _get_cloud_mask(
         self, batch: Dict, input: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        if self.cloud_loss_weight <= 1.0 or self.cloud_mask_key not in batch:
+        """Return cloud mask [B,1,H,W] in [0,1], or None if unavailable."""
+        if self.cloud_mask_key not in batch:
             return None
-
         mask = batch[self.cloud_mask_key]
         if torch.is_tensor(mask):
             mask = mask.to(device=input.device, dtype=input.dtype)
         else:
             mask = torch.as_tensor(mask, device=input.device, dtype=input.dtype)
-
         if mask.ndim == input.ndim - 1:
             mask = mask.unsqueeze(1)
         elif mask.ndim == input.ndim:
@@ -173,7 +179,6 @@ class ConsistencyFlowMatchingLoss(nn.Module):
                 f"Cloud mask '{self.cloud_mask_key}' has shape {tuple(mask.shape)}, "
                 f"expected [B,H,W] or [B,1,H,W] for input {tuple(input.shape)}"
             )
-
         if mask.shape[0] != input.shape[0]:
             raise ValueError(
                 f"Cloud mask batch size {mask.shape[0]} does not match input "
@@ -181,8 +186,16 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             )
         if mask.shape[-2:] != input.shape[-2:]:
             mask = F.interpolate(mask, size=input.shape[-2:], mode="nearest")
+        return mask.clamp(0.0, 1.0)
 
-        mask = mask.clamp(0.0, 1.0)
+    def _get_cloud_weight(
+        self, batch: Dict, input: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if self.cloud_loss_weight <= 1.0 or self.cloud_mask_key not in batch:
+            return None
+        mask = self._get_cloud_mask(batch, input)
+        if mask is None:
+            return None
         weight = 1.0 + (self.cloud_loss_weight - 1.0) * mask
         norm = weight.flatten(1).mean(dim=1).view(
             -1, *([1] * (input.ndim - 1))
@@ -295,6 +308,24 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         )
         clean_endpoint_loss = self._get_loss(f_student, input, cloud_weight)
 
+        ssim_loss = (
+            self._ms_ssim_loss(f_student, input)
+            if self.ssim_endpoint_loss_weight > 0.0
+            else f_student.new_zeros(B)
+        )
+
+        # Non-cloud identity loss: penalise changes to already-clear pixels.
+        # L_id = loss((1-M)*f_student, (1-M)*x_cloudy)
+        if self.non_cloud_identity_loss_weight > 0.0:
+            cloud_mask = self._get_cloud_mask(batch, input)
+            if cloud_mask is not None:
+                non_cloud = 1.0 - cloud_mask
+                identity_loss = self._get_loss(non_cloud * f_student, non_cloud * mu)
+            else:
+                identity_loss = f_student.new_zeros(B)
+        else:
+            identity_loss = f_student.new_zeros(B)
+
         # Warmup: disable the consistency / endpoint terms during the first
         # `consistency_warmup_steps` gradient updates so the student+teacher
         # first learn a correct velocity field from the supervised anchors.
@@ -305,6 +336,8 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             + ramp * self.consistency_loss_weight * velocity_consistency_loss
             + self.velocity_anchor_loss_weight * velocity_anchor_loss
             + self.clean_endpoint_loss_weight * clean_endpoint_loss
+            + self.ssim_endpoint_loss_weight * ssim_loss
+            + self.non_cloud_identity_loss_weight * identity_loss
         )
 
     def _get_loss(
@@ -327,3 +360,50 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         if pixel_weight is not None:
             loss = loss * pixel_weight
         return torch.mean(loss.reshape(pred.shape[0], -1), dim=1)
+
+    def _ms_ssim_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """MS-SSIM loss averaged over batch. Computed per-channel then averaged.
+        Returns shape [B] to match _get_loss convention."""
+        weights = pred.new_tensor(
+            [0.0448, 0.2856, 0.3001, 0.2363, 0.1333], dtype=torch.float32
+        )
+        scales = len(weights)
+        B, C = pred.shape[:2]
+        p = (pred.float().clamp(-1.0, 1.0) + 1.0) * 0.5
+        t = (target.float().clamp(-1.0, 1.0) + 1.0) * 0.5
+        eps = 1e-6
+
+        ms_vals = []
+        for s in range(scales):
+            if s > 0:
+                p = F.avg_pool2d(p, 2)
+                t = F.avg_pool2d(t, 2)
+            # gaussian window per channel via depthwise conv
+            win_size = min(11, p.shape[-1] - (p.shape[-1] % 2 == 0))
+            if win_size < 3:
+                break
+            sigma_g = 1.5
+            coords = torch.arange(win_size, device=p.device, dtype=p.dtype) - win_size // 2
+            g = torch.exp(-(coords ** 2) / (2 * sigma_g ** 2))
+            g = g / g.sum()
+            kernel = g[:, None] * g[None, :]  # [win, win]
+            kernel = kernel.expand(C, 1, win_size, win_size)
+            pad = win_size // 2
+            mu1 = F.conv2d(p, kernel, padding=pad, groups=C)
+            mu2 = F.conv2d(t, kernel, padding=pad, groups=C)
+            mu1_sq, mu2_sq, mu12 = mu1 ** 2, mu2 ** 2, mu1 * mu2
+            sig1_sq = F.conv2d(p * p, kernel, padding=pad, groups=C) - mu1_sq
+            sig2_sq = F.conv2d(t * t, kernel, padding=pad, groups=C) - mu2_sq
+            sig12   = F.conv2d(p * t, kernel, padding=pad, groups=C) - mu12
+            C1, C2 = 0.01 ** 2, 0.03 ** 2
+            cs = (2 * sig12 + C2) / (sig1_sq + sig2_sq + C2)
+            if s < scales - 1:
+                ms_vals.append(cs.mean(dim=[1, 2, 3]).clamp(eps, 1.0))  # [B]
+            else:
+                lum = (2 * mu12 + C1) / (mu1_sq + mu2_sq + C1)
+                ms_vals.append((lum * cs).mean(dim=[1, 2, 3]).clamp(eps, 1.0))
+
+        ssim_val = torch.ones(B, device=pred.device, dtype=torch.float32)
+        for i, v in enumerate(ms_vals):
+            ssim_val = ssim_val * (v.clamp(eps, 1.0) ** weights[i])
+        return (1.0 - ssim_val.clamp(max=1.0)).to(dtype=pred.dtype)
