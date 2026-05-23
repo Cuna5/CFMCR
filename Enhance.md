@@ -157,229 +157,315 @@ $$w=\frac{1+(\lambda_{cloud}-1)M}{mean(1+(\lambda_{cloud}-1)M)}$$
 
 ---
 
-## 可选画质性能优化方向
+## 下一阶段画质提升路线
 
-以下方向中，Charbonnier、CUHK 成对数据增强、云区加权 loss 和 TTA 推理已实装；其余适合作为下一轮 CFM 画质指标优化的实验候选。推荐后续优先从 `SSIM endpoint loss` 和 endpoint fine-tuning 开始，它们最直接服务 PSNR / SSIM / RMSE 这类端点指标。
+前几轮改动说明，继续堆采样技巧和零散 loss 候选收益很有限。当前 CFM 更像一步端点预测器，核心优化应回到训练目标和数据分布本身。后续建议只保留下面几条主线，其他 LPIPS、DCT、边缘 loss、EMA 调度等方向暂时降级为备选，不再作为近期重点。
 
-| 方向 | 主要目标 | 实现思路 | 风险 / 注意点 |
-|------|----------|----------|---------------|
-| SSIM / MS-SSIM endpoint loss | 提升 SSIM 和视觉结构 | 在 `clean_endpoint_loss` 旁加入 `1 - SSIM(f_student, x_clean)`，权重可从 `0.05~0.2` 起试 | 权重大时可能轻微牺牲 PSNR，需要单独扫权重 |
-| 云区加权 loss ✅ | 强化真正被云遮挡区域的恢复 | 已在 `loss_cfm.py` 中使用 `batch["M"]`；默认对 `clean_endpoint_loss` 加权，并可对 velocity anchor 同步加权；`cloud_loss_weight=2.0` | mask 质量差会误导训练；建议继续扫 `1.5/2.0/3.0` |
-| endpoint fine-tuning 阶段 | 进一步优化 1 步输出端点 | 训练后期降低学习率，设置更高 `clean_endpoint_loss_weight` 和 `start_pair_prob`，同时降低 teacher consistency 权重 | 过度 fine-tune 可能降低多步采样稳定性，建议只针对最终 1 步模型使用 |
-| 2-3 步 CFM 评估 | 以较小速度代价换画质 | 推理时把 `sampler.num_steps` 从 `1` 提到 `2` 或 `3`，使用 CFM 内置 Euler 多步路径 | 速度随步数线性增加；主表需明确标注步数 |
-| 梯度 / 边缘 loss | 改善建筑、道路和地物边界 | 对 `f_student` 和 `x_clean` 加 Sobel / finite-difference loss，权重可从 `0.05~0.1` 起试 | 可能放大噪声或边缘伪影，不建议权重过大 |
-| 光谱一致性 loss | 改善多光谱真实性 | 在多波段输出上加入 per-band loss、band ratio consistency 或 SAM loss | SAM / ratio loss 对接近 0 的波段值敏感，需要 clamp 或 epsilon |
-| hard example / hard crop sampling | 提升厚云和复杂地表样本表现 | 提高厚云、云边界、纹理密集 crop 的采样概率 | 需要统计样本难度；采样过偏会影响整体分布 |
-| EMA decay 调度 | 改善 teacher 跟随速度 | 前期使用较低 decay（如 `0.999`），后期升到 `0.9999`；或固定试 `0.9995` | teacher 太快会不稳定，太慢会滞后；需要和 warmup 一起调 |
-| Charbonnier loss ✅ | 减少 L2 导致的模糊 | 已实装，见上方"已实装"章节 | 改动最小；ε 越小越接近 L1，默认 `1.0e-3` |
-| LPIPS 感知 loss | 改善视觉结构和 SSIM | 环境已有 `lpips==0.1.4`，在 `forward` 里对 `f_student` 和 `x_clean` 加 `lpips.LPIPS(net='alex')` 项，权重从 `0.01~0.05` 起试 | 需要 3 通道输入，多波段需先选 RGB 子集；权重过大会牺牲 PSNR |
-| DCT 频域 loss | 补偿高频细节和纹理 | 环境已有 `dctorch==0.1.2`，对 `f_student` 和 `x_clean` 做 `dct_2d` 后算 L2；可对高频系数额外加权 | 高频权重过大会放大噪声；建议先用均匀权重验证方向 |
-| 多尺度 endpoint loss | 稳定全局色彩同时保细节 | 对 `f_student` 和 `x_clean` 分别在 1×、0.5×、0.25× 分辨率下算 `clean_endpoint_loss`，低分辨率权重可略高 | 实现稍复杂；下采样方式（bilinear/area）影响结果，建议用 area |
-| Test-Time Augmentation（TTA） ✅ | 推理阶段零成本提升 PSNR | 已在 `sampling_cfm.py` 中实装，4 种几何变换（原图 + 水平翻转 + 垂直翻转 + 180° 旋转）推理后平均输出；YAML 中设置 `tta: True` 或 CLI 追加参数即可启用 | PSNR 通常涨 0.1~0.3 dB；推理时间变为 4×，需在论文中注明 |
-| 自适应 σ 采样 | 让模型更多训练难学的 σ 段 | 训练中统计各 σ 区间的平均 loss，按 loss 大小动态调整采样概率，替代固定的 `start_pair_prob` | 需要额外统计开销；采样过偏可能破坏整体分布，建议设置采样概率下界 |
+### 1. 回到确定性 1-step CFM
 
-建议实验顺序：
+`s_churn` 对当前 CFM 不适合作为画质指标优化主线。CFM 训练点在确定性 OT 直线路径上，没有学习额外高斯噪声去噪；加入扰动会把状态推离训练分布，容易导致 PSNR / SSIM / RMSE 明显下降，严重时输出噪声图。
 
-1. `Charbonnier loss`：改动最小，先验证是否稳定提升 PSNR/SSIM，再叠加其他项。
-2. `LPIPS loss`：库已装，小权重叠加，主要改善 SSIM 和视觉结构。
-3. `SSIM endpoint loss`：先看 SSIM 是否稳定提升，以及 PSNR 是否可接受。
-4. `DCT 频域 loss`：库已装，补高频细节，与 Charbonnier 叠加效果互补。
-5. `TTA 推理`：已实装，零训练成本，可在任意阶段直接测试。
-6. 云区加权 loss：已实装，建议扫 `cloud_loss_weight=1.5/2.0/3.0` 并观察云区 / 非云区指标是否同时稳定。
-7. endpoint fine-tuning：作为训练后期小学习率阶段，而不是从头训练就强行提高 endpoint 权重。
-8. `sampler.num_steps=2/3`：作为质量/速度折中结果加入对比表。
-9. 多尺度 loss、自适应 σ 采样：收益不确定，作为后期消融实验候选。
+建议先固定如下基线：
 
-## 可调参数建议
-
-按影响优先级排列，适合在训练或评估时尝试调整：
-
-### 损失权重（最直接影响画质指标）
-
-| 参数路径 | 当前值 | 调整建议 |
-|----------|--------|----------|
-| `loss_fn_config.params.clean_endpoint_loss_weight` | `1.0` | 提高至 `1.5~2.0`，加强 PSNR/SSIM 直接监督 |
-| `loss_fn_config.params.velocity_anchor_loss_weight` | `1.0` | 适当提高，使速度场更准确 |
-| `loss_fn_config.params.endpoint_loss_weight` | `0.5` | 降低可减少 teacher 噪声干扰 |
-| `loss_fn_config.params.consistency_loss_weight` | `0.5` | 同上，与 endpoint_loss_weight 联动调整 |
-| `loss_fn_config.params.cloud_loss_weight` | `2.0` | 已启用云区加权，可扫 `1.5/2.0/3.0`；过高可能损伤非云区色彩 |
-| `loss_fn_config.params.start_pair_prob` | `0.35` | 提高至 `0.5` 可增强 1 步推理能力，但可能损失多步泛化 |
-
-### 推理步数（测试时调，无需重训）
-
-从 1 改到 3 通常有明显画质提升，代价是推理耗时增加约 3 倍：
-
-```bash
-model.params.sampler_config.params.num_steps=3
-```
-
-### 学习率调度
-
-| 参数路径 | 当前值 | 调整建议 |
-|----------|--------|----------|
-| `model.base_learning_rate` | `1e-4` | 可试 `5e-5`（更稳定）或 `2e-4`（更快收敛） |
-| `scheduler_config.params.max_decay_steps` | `400000` | 若训练步数超过此值应相应增大 |
-| `loss_fn_config.params.consistency_warmup_steps` | `2000` | 训练不稳定时可增大至 `5000` |
-
-### 其他
-
-| 参数路径 | 当前值 | 调整建议 |
-|----------|--------|----------|
-| `model.params.teacher_ema_decay` | `0.9999` | 训练初期可降至 `0.999`，让 teacher 更新更快 |
-| `loss_fn_config.params.num_steps` | `40` | 增大至 `80~100` 可降低 σ pair 误差，但训练变慢 |
-| `data.params.batch_size` | `2` | 显存允许时增大，训练更稳定 |
-
-## 代码层面提升 PSNR/SSIM 的方向
-
-以下是通过代码审查发现的、有潜力提升画质指标的方向，包含已实装项和后续实验候选，按预期收益排序：
-
-### 1. 数据增强（翻转/90度旋转，已实装）
-
-已在 `sgm/data/cuhk/image_datasets.py` 中为 CUHK CFM 训练加入基础成对数据增强。`TrainDataset` 新增 `augment`、`hflip_p`、`vflip_p`、`rot90_p` 参数；`_augment_pair()` 会对 clean label `t` 和 cloudy input `x` 同步执行水平翻转、垂直翻转和 90 度整数倍旋转。
-
-增强放在 `imresize()` 之后、`M` mask 计算之前，因此 `label`、`cond_image` 和 `M` 的空间位置保持一致。当前只在 `cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml` 的 `train` dataloader 中开启，validation / test / predict 不开启增强。
-
-预期提升：+0.2~0.5 dB PSNR。
-
-```yaml
-train:
-  target: sgm.data.cuhk.image_datasets.TrainDataset
-  params:
-    augment: True
-    hflip_p: 0.5
-    vflip_p: 0.5
-    rot90_p: 0.5
-```
-
-### 2. SSIM endpoint loss
-
-代码库中 `sgm/modules/learning/pytorch_ssim/` 已有可微分 SSIM 实现，但训练时未使用。在 `loss_cfm.py` 中新增第 5 个损失项：
-
-```python
-ssim_loss = 1 - ssim(f_student, x_clean)
-```
-
-建议权重从 `0.05~0.2` 起试，直接优化 SSIM 指标。
-
-### 3. LPIPS 感知 loss
-
-`lpips==0.1.4` 已安装且评估时已使用，但训练时未参与。小权重（`0.01~0.05`）叠加可改善结构保真度和 SSIM。注意 LPIPS 只支持 3 通道输入，需要先取 RGB 子集。
-
-### 4. 云区加权 loss
-
-已在 CFM 专属损失 `sgm/modules/diffusionmodules/loss_cfm.py` 中实装。数据加载时已有云 mask `M = np.clip((t-x).sum(axis=2), 0, 1)`，loss 现在直接从 batch 读取 `cloud_mask_key: "M"`，不需要把 mask 通过 `batch2model_keys` 传给网络。
-
-实现方式：
-- `_get_cloud_weight()` 将 `[B,H,W]` 或 `[B,1,H,W]` 的 `M` 转为像素权重 `1 + (cloud_loss_weight - 1) * M`。
-- 权重按每个样本的均值归一化，避免云比例不同导致整体 loss 尺度漂移。
-- 默认加权 `clean_endpoint_loss`；当 `cloud_weight_velocity_anchor: True` 时，同步加权 `velocity_anchor_loss`。
-- `cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml` 当前默认 `cloud_loss_weight: 2.0`，建议后续做 `1.5/2.0/3.0` 消融。
-
-### 5. Test-Time Augmentation（TTA，已实装）
-
-零训练成本。推理时对输入做 4 种几何变换（原图、水平翻转、垂直翻转、水平+垂直翻转/180° 旋转），分别推理后逆变换并取平均输出。预期提升 +0.1~0.3 dB PSNR，推理时间变为 4 倍。
-
-**改动文件：**
-
-- `sgm/modules/diffusionmodules/sampling_cfm.py`：新增 `tta` 构造参数、`_apply_transform_to_cond()` / `_sample_single()` / `_sample_with_tta()` 方法。在 `__call__` 入口处，当 `self.tta=True` 时走 TTA 路径。TTA 对 `mu` 和所有 4-D cond 张量（如拼接的 cloudy image）同步变换，保证空间一致性。
-- `configs/example_training/cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml`：`sampler_config.params` 新增 `tta: False`，默认关闭。
-
-**启用方式：**
-
-方法 1 — 修改 YAML：
 ```yaml
 sampler_config:
   params:
-    tta: True
+    num_steps: 1
+    tta: False
+    s_churn: 0.0
 ```
 
-方法 2 — CLI 覆盖（无需修改文件）：
-```bash
-python main.py --base configs/example_training/cuhk_cfm.yaml \
-    -t false \
-    model.params.sampler_config.params.tta=True
+在这个基线稳定后，再单独评估 `tta=True`。多步和扰动不再作为默认提分手段。
+
+### 2. 加 MS-SSIM endpoint loss ✅
+
+已实装。`loss_cfm.py` 新增 `_ms_ssim_loss` 方法（纯 PyTorch，无额外依赖），在 `_forward` 中当 `ssim_endpoint_loss_weight > 0` 时叠加到 `clean_endpoint_loss` 上：
+
+```text
+total_loss += ssim_endpoint_loss_weight * (1 - MS_SSIM(f_student, x_clean))
 ```
 
-**注意事项：**
-- TTA 模式下不返回 `intermediates` / `denoiseds`（多变换平均后无意义），image_logger 的中间步可视化会变为空。建议仅在 test / predict 时开启，训练时的 validation 保持 `tta: False`。
-- TTA 与 `num_steps>1` 多步采样兼容，可叠加使用（推理时间为 4×num_steps）。
+两个 YAML 均已加入参数（默认 `0.0`，不影响现有训练）：
 
-### 6. 输出 clamp
+```yaml
+loss_fn_config:
+  params:
+    ssim_endpoint_loss_weight: 0.0   # scan 0.02/0.05/0.1/0.2
+```
 
-当前 CFM sampler 输出 `x_clean` 后没有做值域裁剪，网络输出可能超出 [-1, 1] 范围导致异常像素。在 `sampling_cfm.py` 的输出处添加 `x.clamp(-1, 1)` 是最简单的兜底。
+注意事项：
 
-### 7. endpoint fine-tuning 阶段
+- MS-SSIM 输入建议转到 `[0, 1]`，即 `(x.clamp(-1, 1) + 1) / 2`。
+- 当前 CUHK CFM 输出为 4 通道，MS-SSIM 可优先只对 RGB 三通道计算，NIR 继续由 Charbonnier / RMSE 约束。
+- 权重过大可能提升 SSIM 但损伤 PSNR / RMSE，需要单独消融。
 
-训练后期从已有 checkpoint 继续训练，降低学习率（如 `base_learning_rate: 2e-5`），同时提高 `clean_endpoint_loss_weight` 到 `2.0~3.0`、提高 `start_pair_prob` 到 `0.5~0.6`、降低 `endpoint_loss_weight` 和 `consistency_loss_weight` 到 `0.2`，让训练完全聚焦于 1 步输出的画质端点。
+### 3. 做 endpoint fine-tuning
 
-### 8. EMA teacher decay 调度
+不要一开始就把所有权重调得很激进。更稳的方式是先用当前配置训练出稳定 checkpoint，再进入小学习率微调阶段，把训练目标集中到一步端点画质。
 
-当前 `teacher_ema_decay` 固定为 `0.9999`。可改为前 5000 步使用 `0.999`（teacher 快速跟随），之后线性升至 `0.9999`（teacher 稳定）。需要修改 `diffusion_cfm.py` 中的 `_update_teacher()` 方法。
+建议 fine-tuning 起点：
 
-### 9. 梯度/边缘 loss
+```yaml
+model:
+  base_learning_rate: 2.0e-5
+  params:
+    ckpt_path: "/path/to/stable_cfm.ckpt"
+    loss_fn_config:
+      params:
+        clean_endpoint_loss_weight: 2.0
+        velocity_anchor_loss_weight: 1.0
+        endpoint_loss_weight: 0.2
+        consistency_loss_weight: 0.2
+        start_pair_prob: 0.5
+```
 
-对 `f_student` 和 `x_clean` 施加 Sobel 或 finite-difference 算子后计算 loss，权重 `0.05~0.1`，改善建筑、道路等地物边界的恢复效果。
+推荐扫描：
 
-### 建议实验顺序
+| 参数 | 参考范围 |
+|------|----------|
+| `base_learning_rate` | `1.0e-5 / 2.0e-5 / 5.0e-5` |
+| `clean_endpoint_loss_weight` | `1.5 / 2.0 / 3.0` |
+| `start_pair_prob` | `0.35 / 0.5 / 0.6` |
+| `endpoint_loss_weight` / `consistency_loss_weight` | `0.1 / 0.2 / 0.5` |
 
-| 优先级 | 方向 | 是否需要重新训练 | 预期 PSNR 提升 |
-|--------|------|-----------------|---------------|
-| 1 | 数据增强（翻转/90度旋转） | 是 | 已实装，建议先短训验证 +0.2~0.5 dB |
-| 2 | TTA 推理 | 否 | 已实装，建议在已有 checkpoint 上直接测试 +0.1~0.3 dB |
-| 3 | SSIM endpoint loss | 是 | +0.1~0.3 dB |
-| 4 | 云区加权 loss | 是 | 已实装，建议扫 `1.5/2.0/3.0` |
-| 5 | 输出 clamp | 否 | 防止异常值拉低均值 |
-| 6 | LPIPS loss | 是 | 主要改善 SSIM |
-| 7 | endpoint fine-tuning | 是（微调） | +0.1~0.2 dB |
-| 8 | EMA decay 调度 | 是 | 不确定 |
-| 9 | 梯度/边缘 loss | 是 | +0.05~0.1 dB |
+该阶段只服务最终 1-step 指标，不再追求多步泛化。
 
+### 4. 加 hard / cloud crop sampling
 
+如果全图大部分区域本来就干净，模型容易学成保守复原，指标提升也会很慢。更有效的方向是提高训练中厚云、云边界、纹理复杂区域的出现概率。
 
-本次通读代码后，除前面已经列出的画质优化外，还有几类更偏工程和评估可信度的提升方向。它们不一定直接改变网络结构，但会影响实验能否稳定复现、预测流程能否跑通，以及 PSNR / SSIM / RMSE 是否能真实反映去云质量。
+建议做法：
 
-| 优先级 | 方向 | 触发代码 / 现象 | 建议处理 |
-|--------|------|----------------|----------|
-| P0 | 预测 batch size 与 `predict_step` 对齐 | `ResidualDiffusionEngine.predict_step()` 和 `TemporalResidualDiffusionEngine.predict_step()` 都断言 `batch size == 1`，但 `cuhk_cfm.yaml` / `cuhkv2_cfm.yaml` 当前 `data.params.batch_size=4` | 为 `DataModuleFromConfig` 增加 `predict_batch_size`，或在预测命令 / 配置里单独强制 `batch_size=1`；否则 `--predict` 会直接触发断言 |
-| P0 | 评估数值稳定性 | `metrics.py` 中 PSNR 使用 `20 * log10(1 / rmse)`，SAM 分母也没有 epsilon；完美预测或全零波段可能产生 `inf` / `nan` | 在 RMSE 和光谱范数分母加入 `eps`，并在 `avg_img_metrics.add()` 中明确处理 `inf`；这样结果表不会被异常值污染 |
-| P1 | 云区 / 非云区分区指标接入主评估 | `metrics.img_metrics()` 已支持 `masks`，CUHK dataloader 也返回 `M`，但 `shared_test_step()` / `predict_step()` 调用指标时没有传 mask | 把 `M` 或 `masks` 通过评估链路传入，输出 `RMSE_cloudy`、`RMSE_cloudfree` 等指标；这比单一全图 RMSE 更能说明去云区域是否真的改善 |
-| P1 | 推理输出统一 clamp / range policy | `sampling_cfm.py` 返回 `x_clean` 后没有统一裁剪，后续评估和保存才做部分 `scale_01` | 在 sampler 或 decode 后建立统一策略：默认 `clamp(-1, 1)`，同时保留可关闭开关，避免异常像素影响指标和 GeoTIFF 保存 |
-| P1 | 成对数据增强扩展与复现性 | CUHK CFM 已实装水平翻转、垂直翻转和 90 度旋转；Sen2_MTC_New 的增强仍依赖可变的 `self.index`，在 shuffle / 多 worker 下不够可复现 | 先对 CUHK 增强做短训消融；后续将同样的配置式同步增强扩展到多时相数据，并让随机数按样本 index 或 worker seed 生成 |
-| P1 | 数据缓存路径可配置 | Sentinel dataloader 会在数据目录写 `path.txt` 和 `_mask.npy`，只读数据盘或多进程首次运行时可能出错或竞争 | 增加独立 `cache_dir`，缓存文件按 split / cloud mask 类型命名；写缓存时使用临时文件再原子替换 |
-| P2 | DataModule 支持分阶段 batch size | 当前 train / val / test / predict 共用同一个 `batch_size`，但训练、测试、预测的显存与保存需求不同 | 支持 `train_batch_size`、`val_batch_size`、`test_batch_size`、`predict_batch_size`，默认回退到原 `batch_size`，减少为了预测而牺牲训练吞吐 |
-| P2 | RGB-only CUHK 兼容性修复 | `TrainDataset.__init__()` 默认允许 `nir_datasets_dir=None`，但随后直接 `len(self.nir_imlistl)` 会在无 NIR 时出错 | 仅在 `nir_datasets_dir is not None` 时检查 RGB / NIR 数量一致；同时根据通道数自动调整 `network_config.in_channels/out_channels` |
-| P2 | 轻量 smoke tests / 配置检查 | 当前 `test_k_diffusion.py` 更像 FLOPs 脚本，依赖 CUDA 和 `calflops`，不适合作为快速回归测试 | 增加 CPU 可跑的 smoke tests：CFM loss 前向、1 步 sampler shape/range、DataModule 小样本切分、metrics 零误差稳定性、YAML target 可实例化检查 |
+- 根据 `M` mask 统计每张图或每个 crop 的云量比例。
+- 提高厚云区域、云边界区域、纹理密集区域 crop 的采样概率。
+- 保留一部分普通样本，避免采样过偏导致整体色彩分布漂移。
 
-### 建议加入下一轮实验 / 开发顺序
+推荐起步比例：
 
-1. 先修 `predict_batch_size=1` 和评估 `eps`，这是避免流程失败和指标异常的基础项。
-2. 接着接入 mask 分区指标与统一输出 clamp，用于更可靠地观察后续画质优化收益。
-3. 然后对已实装的 CUHK 成对数据增强做短训消融，确认收益后再扩展到 Sen2_MTC_New / Sentinel 多时相场景。
-4. 最后补 smoke tests 和可配置缓存目录，降低后续继续叠加 CFM loss 等优化时的回归成本。
+| 样本类型 | 采样占比 |
+|----------|----------|
+| 普通随机 crop | `40%~60%` |
+| 高云量 crop | `20%~40%` |
+| 云边界 / 复杂纹理 crop | `10%~30%` |
 
-## V1.4版本说明
-1. 修正TTA推理会发生报错的BUG。
-2. CFM 多步推理引入 EMRDM 式随机扰动（s_churn）
-在 `ConsistencyFlowMatchingSampler` 的多步 Euler 积分中，借鉴 EMRDM `ResidualEDMSampler` 的 `s_churn` 机制，在每步前对当前状态注入随机噪声：
+这类数据分布改动通常比继续微调小 loss 更可能带来可见收益。
 
-$$\hat{\sigma}_i = \sigma_i (1 + \gamma), \quad \gamma = \min\!\left(\frac{s\_churn}{N-1},\ \sqrt{2}-1\right)$$
+### 5. 大模型伪无云图辅助监督
 
-$$\hat{x} = x + \sqrt{\hat{\sigma}_i^2 - \sigma_i^2}\cdot s\_noise \cdot \varepsilon, \quad \varepsilon \sim \mathcal{N}(0,I)$$
+可以离线使用大模型为训练集 cloudy image 生成伪无云图，将这些图作为辅助监督引导 CFM 恢复云区结构。该方向可能改善云区纹理和 SSIM，但对 PSNR / RMSE 有风险：大模型生成图如果和真实 clean label 像素、颜色或光谱不完全一致，可能视觉更好但 PSNR 下降。
 
-扰动后以 $\hat{\sigma}_i$ 替代 $\sigma_i$ 做 Euler 步，其余流程不变。
+核心原则：
 
-**新增参数**（均可在 YAML `sampler_config.params` 中配置）：
+- 伪无云图只作为辅助监督，不替代真实 `label`。
+- 优先只在云区使用 pseudo loss，避免改坏原本干净区域。
+- 权重要小，建议从 `0.02~0.05` 开始。
+- 如果大模型只生成 RGB，则只监督 RGB 三通道；NIR 仍由真实 label 监督。
+- 推理阶段不依赖大模型，避免训练 / 推理条件不一致。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `s_churn` | `0.0` | 扰动强度，0 表示关闭（退化为原确定性 ODE） |
-| `s_tmin` | `0.0` | 只在 `sigma >= s_tmin` 的步骤加扰动 |
-| `s_tmax` | `inf` | 只在 `sigma <= s_tmax` 的步骤加扰动 |
-| `s_noise` | `1.0` | 噪声幅度缩放 |
+#### 数据准备
 
-**注意：**
-- 仅对多步推理（`num_steps > 1`）生效；1 步推理路径不受影响。
-- TTA 在 `num_steps > 1` 时会调用 `_multi_step`，因此可与 s_churn 叠加；默认 `num_steps=1` 时仍是确定性一步路径，不触发扰动。
-- `sigma_hat` 会被限制在采样时间表的最大 `sigma` 内，避免首步从 `sigma=1.0` 扰动到训练范围外。
-- 建议先在 `num_steps=4~8` 下扫 `s_churn=0.1~0.5`，观察 PSNR/SSIM 变化。
-3. 优化相关参数说明。
+推荐保存为和原训练集同名的目录结构：
+
+```text
+CUHK-CR2_pseudo/
+  train/
+    label/
+      xxx.png
+      yyy.png
+```
+
+在 dataloader 中新增配置：
+
+```yaml
+train:
+  params:
+    pseudo_clean_dir: "/path/to/CUHK-CR2_pseudo"
+    pseudo_rgb_only: True
+```
+
+实现时需要在 `sgm/data/cuhk/image_datasets.py` 中读取同名 pseudo 图，并和 `label / cond_image` 同步 resize、同步数据增强，最后返回：
+
+```python
+{
+    "pseudo_clean": pseudo,
+}
+```
+
+同步增强很重要，否则 pseudo 图和真实 label / cloudy input 会空间错位。
+
+#### Loss 接入
+
+在 `sgm/modules/diffusionmodules/loss_cfm.py` 中，基于当前 endpoint 输出：
+
+```python
+f_student = x_tn + sigma_n_bc * v_student
+```
+
+增加低权重 pseudo endpoint loss：
+
+```text
+L_pseudo = Charbonnier(f_student_rgb, pseudo_clean_rgb)
+L_total += pseudo_clean_loss_weight * L_pseudo
+```
+
+推荐新增参数：
+
+```yaml
+loss_fn_config:
+  params:
+    pseudo_clean_key: "pseudo_clean"
+    pseudo_clean_loss_weight: 0.02
+    pseudo_clean_rgb_only: True
+    pseudo_clean_cloud_only: True
+    pseudo_clean_start_step: 2000
+```
+
+其中 `pseudo_clean_start_step` 用于前期先让模型学习真实 clean label，再逐步引入伪标签辅助，降低被生成图带偏的风险。
+
+#### 云区和置信度加权
+
+最简单的方式是只在 `M` 云区监督：
+
+```text
+pseudo_weight = M
+```
+
+如果训练集有真实 clean label，可以进一步用 pseudo 和真实 label 的差异构造置信度：
+
+```text
+confidence = exp(-abs(pseudo_clean - label) / tau)
+pseudo_weight = M * confidence
+```
+
+这样 pseudo 与真实 label 差距过大的区域会自动降权，更有利于 PSNR / RMSE。
+
+#### 是否值得做的筛选标准
+
+在正式训练前，先统计训练集上：
+
+```text
+PSNR(pseudo_clean, label)
+PSNR(cloudy, label)
+SSIM(pseudo_clean, label)
+SSIM(cloudy, label)
+```
+
+如果 `PSNR(pseudo_clean, label)` 至少比 `PSNR(cloudy, label)` 高 `1~2 dB`，低权重云区辅助更值得尝试。若 pseudo 本身 PSNR 不高，则它更可能只改善视觉或 SSIM，甚至损伤 PSNR。
+
+推荐微调策略：
+
+```yaml
+model:
+  base_learning_rate: 2.0e-5
+  params:
+    ckpt_path: "/path/to/stable_cfm.ckpt"
+    loss_fn_config:
+      params:
+        clean_endpoint_loss_weight: 2.0
+        pseudo_clean_loss_weight: 0.02
+        pseudo_clean_rgb_only: True
+        pseudo_clean_cloud_only: True
+        endpoint_loss_weight: 0.2
+        consistency_loss_weight: 0.2
+        start_pair_prob: 0.5
+```
+
+建议消融：
+
+| 实验 | 设置 |
+|------|------|
+| baseline | 不使用 pseudo clean |
+| pseudo low | `pseudo_clean_loss_weight=0.02` |
+| pseudo mid | `pseudo_clean_loss_weight=0.05` |
+| pseudo cloud-only | 只在 `M` 云区启用 |
+| pseudo confidence | 云区 + pseudo/label 置信度加权 |
+
+### 6. 输出 clamp 作为指标兜底
+
+CFM sampler 输出如果超出 `[-1, 1]`，少量异常像素也可能拖低 RMSE / PSNR。建议在 sampler 最终输出处加可配置 clamp：
+
+```python
+x_clean = x_clean.clamp(-1, 1)
+```
+
+建议新增参数：
+
+```yaml
+sampler_config:
+  params:
+    clamp_output: True
+```
+
+这不是核心提分策略，但可以避免异常值污染指标和保存结果。
+
+### 7. 如果要多步，就训练多步
+
+当前多步推理只是把一步 CFM 速度场拿来做 Euler 积分。模型训练时看到的是理想 OT 路径点；推理多步时前一步误差会让下一步状态偏离训练分布，因此步数增加后指标下降是合理现象。
+
+如果目标是让 `num_steps=2/3/4` 真正优于 1 步，需要加入 sampler-aware training：
+
+1. 从 `x=mu, sigma=sigma_max` 开始。
+2. 用当前 sampler 更新一步得到 `x_next`。
+3. 把 `x_next` 再喂回模型，展开 2-4 步。
+4. 对最终 endpoint 计算 `x_clean` loss。
+
+这会增加训练显存和时间，但它和“只在推理时调大步数”不是同一件事。近期若主目标是指标，优先保持 1-step。
+
+### 当前推荐实验顺序
+
+1. 固定确定性 1-step：`num_steps=1, s_churn=0.0, tta=False`，得到稳定基线。
+2. 加 MS-SSIM endpoint loss，扫 `ssim_endpoint_loss_weight=0.02/0.05/0.1/0.2`。
+3. 基于稳定 checkpoint 做 endpoint fine-tuning。
+4. 加 hard / cloud crop sampling，重新训练或微调。
+5. 统计 pseudo clean 质量；若 pseudo 明显优于 cloudy，再做低权重云区辅助微调。
+6. 加输出 clamp，确认异常值不会拖低指标。
+7. 最后单独评估 `tta=True`，作为无需重训的推理增强。
+
+### 暂不作为近期主线的方向
+
+- `s_churn`：当前已验证可能导致噪声图，除非重新设计带噪训练，否则不建议继续投入。
+- 单纯增加 `sampler.num_steps`：没有多步训练配合时，指标可能下降。
+- LPIPS / DCT / 边缘 loss：可能改善视觉观感，但对 PSNR / RMSE 不一定友好，先不作为主线。
+- EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
+
+## V1.5版本说明
+1. 加入 MS-SSIM endpoint loss
+2. 提出新的大模型改进方向（不好推进）
+3. Non-cloud Identity Loss 实装
+
+### 改动内容
+
+**`sgm/modules/diffusionmodules/loss_cfm.py`**
+
+- 新增 `_get_cloud_mask` 辅助方法，将 mask 提取逻辑从 `_get_cloud_weight` 中分离，供多处复用。
+- `__init__` 新增参数 `non_cloud_identity_loss_weight`（默认 `0.0`）。
+- `_forward` 中当 `non_cloud_identity_loss_weight > 0` 且 mask 可用时，计算：
+
+$$\mathcal{L}_{id} = \text{loss}\bigl((1-M)\cdot f_\theta,\;(1-M)\cdot x_{cloudy}\bigr)$$
+
+并加入总损失：
+
+$$\mathcal{L}_{total} \mathrel{+}= \lambda_{id}\cdot\mathcal{L}_{id}$$
+
+**`configs/example_training/cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml`**
+
+新增：
+
+```yaml
+non_cloud_identity_loss_weight: 0.2  # scan 0.1/0.2/0.3
+```
+
+### 作用
+
+非云区域本来就是清晰的，模型不应改动这些像素。PSNR 是整图指标，非云区被轻微改坏会直接拉低整体分数。该损失项强制 `f_student` 在非云区与 `x_cloudy` 保持一致，是最稳定的整图 PSNR 提升手段之一。
+
+### 推荐消融
+
+| 实验 | `non_cloud_identity_loss_weight` |
+|------|----------------------------------|
+| baseline | `0.0` |
+| low | `0.1` |
+| mid（默认） | `0.2` |
+| high | `0.3` |
+
+权重过大可能限制云区恢复自由度，建议从 `0.2` 开始。
