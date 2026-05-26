@@ -81,6 +81,7 @@ model:
         cloud_mask_key: "M"              # CUHK dataloader cloud mask
         cloud_loss_weight: 2.0           # cloud pixels are weighted 2x, then normalized per sample
         cloud_weight_velocity_anchor: True
+        feather_mask_kernel: 7           # 软化云掩膜核大小（奇数，如 7 或 11），0 表示关闭，用于减少边缘扭曲
         start_pair_prob: 0.35            # oversample σ≈1 for 1-step quality
         # Two-stage warmup: disable consistency terms for the first N steps
         # so the teacher can stabilise while supervised anchors shape velocity.

@@ -430,3 +430,14 @@ sampler_config:
 
 ## V1.6版本说明
 
+### 软化云区掩膜（Feathering / Soft Cloud Mask） ✅
+
+针对 1 步或多步恢复图像中出现的**边缘扭曲、锯齿与毛刺**现象，本轮新增了云区掩膜空间平滑软化（羽化）功能，旨在使云区损失过渡更加平滑，稳定图像重建质量。
+
+- **核心背景**：原有的云区加权损失在边界上存在陡峭的二值跳变（如从云区的权重 `2.0` 骤降到非云区的较小值），这会在边界区域引入很大的空间梯度不连续性，导致网络在反向传播时在该边界处产生优化不稳定，造成图像重建后的边缘扭曲。
+- **解决方案**：在计算加权 Loss 前，对提取出的 `M` mask 进行空间平均池化平滑操作，将硬边界羽化为具有渐变带的软掩膜，从而使边界区域的损失平滑过渡，消除了梯度断层导致的边缘扭曲。
+- **代码实现**：
+  - `sgm/modules/diffusionmodules/loss_cfm.py` 中的 `ConsistencyFlowMatchingLoss` 构造函数新增 `feather_mask_kernel` 参数（默认 `0` 表示不开启，通常设为大于 1 的奇数如 `7`、`11` 开启）。
+  - 在 `_get_cloud_mask` 内部，若 `feather_mask_kernel > 1`，则应用 `F.avg_pool2d` 进行空间平滑处理，并在最后 clamp 回 `[0.0, 1.0]`，从而不改变整体的掩膜数值范围。
+- **配置与实验**：
+  - 在 [cuhk_cfm.yaml](file:///c:/Users/47651/OneDrive/Data/CODE/CR/EMRDM-ODE/configs/example_training/cuhk_cfm.yaml) 和 [cuhkv2_cfm.yaml](file:///c:/Users/47651/OneDrive/Data/CODE/CR/EMRDM-ODE/configs/example_training/cuhkv2_cfm.yaml) 中已默认新增参数配置 `feather_mask_kernel: 7`，默认激活此项平滑优化。

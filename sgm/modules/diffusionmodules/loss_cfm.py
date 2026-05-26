@@ -116,6 +116,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         cloud_mask_key: str = "M",
         cloud_loss_weight: float = 1.0,
         cloud_weight_velocity_anchor: bool = False,
+        feather_mask_kernel: int = 0,
         consistency_warmup_steps: int = 0,
         ssim_endpoint_loss_weight: float = 0.0,
         non_cloud_identity_loss_weight: float = 0.0,
@@ -137,6 +138,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.cloud_mask_key = cloud_mask_key
         self.cloud_loss_weight = max(float(cloud_loss_weight), 1.0)
         self.cloud_weight_velocity_anchor = bool(cloud_weight_velocity_anchor)
+        self.feather_mask_kernel = int(feather_mask_kernel)
         self.ssim_endpoint_loss_weight = float(ssim_endpoint_loss_weight)
         self.non_cloud_identity_loss_weight = float(non_cloud_identity_loss_weight)
         # While training from scratch the teacher is random for the first
@@ -186,6 +188,12 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             )
         if mask.shape[-2:] != input.shape[-2:]:
             mask = F.interpolate(mask, size=input.shape[-2:], mode="nearest")
+        if self.feather_mask_kernel > 1:
+            k_size = self.feather_mask_kernel
+            if k_size % 2 == 0:
+                k_size += 1
+            pad = k_size // 2
+            mask = F.avg_pool2d(mask, kernel_size=k_size, stride=1, padding=pad)
         return mask.clamp(0.0, 1.0)
 
     def _get_cloud_weight(
