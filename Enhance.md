@@ -428,44 +428,16 @@ sampler_config:
 - LPIPS / DCT / 边缘 loss：可能改善视觉观感，但对 PSNR / RMSE 不一定友好，先不作为主线。
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
-## V1.5版本说明
-1. 加入 MS-SSIM endpoint loss
-2. 提出新的大模型改进方向（不好推进）
-3. Non-cloud Identity Loss 实装
+## V1.6版本说明
 
-### 改动内容
+### 软化云区掩膜（Feathering / Soft Cloud Mask） ✅
 
-**`sgm/modules/diffusionmodules/loss_cfm.py`**
+针对 1 步或多步恢复图像中出现的**边缘扭曲、锯齿与毛刺**现象，本轮新增了云区掩膜空间平滑软化（羽化）功能，旨在使云区损失过渡更加平滑，稳定图像重建质量。
 
-- 新增 `_get_cloud_mask` 辅助方法，将 mask 提取逻辑从 `_get_cloud_weight` 中分离，供多处复用。
-- `__init__` 新增参数 `non_cloud_identity_loss_weight`（默认 `0.0`）。
-- `_forward` 中当 `non_cloud_identity_loss_weight > 0` 且 mask 可用时，计算：
-
-$$\mathcal{L}_{id} = \text{loss}\bigl((1-M)\cdot f_\theta,\;(1-M)\cdot x_{cloudy}\bigr)$$
-
-并加入总损失：
-
-$$\mathcal{L}_{total} \mathrel{+}= \lambda_{id}\cdot\mathcal{L}_{id}$$
-
-**`configs/example_training/cuhk_cfm.yaml` 和 `cuhkv2_cfm.yaml`**
-
-新增：
-
-```yaml
-non_cloud_identity_loss_weight: 0.2  # scan 0.1/0.2/0.3
-```
-
-### 作用
-
-非云区域本来就是清晰的，模型不应改动这些像素。PSNR 是整图指标，非云区被轻微改坏会直接拉低整体分数。该损失项强制 `f_student` 在非云区与 `x_cloudy` 保持一致，是最稳定的整图 PSNR 提升手段之一。
-
-### 推荐消融
-
-| 实验 | `non_cloud_identity_loss_weight` |
-|------|----------------------------------|
-| baseline | `0.0` |
-| low | `0.1` |
-| mid（默认） | `0.2` |
-| high | `0.3` |
-
-权重过大可能限制云区恢复自由度，建议从 `0.2` 开始。
+- **核心背景**：原有的云区加权损失在边界上存在陡峭的二值跳变（如从云区的权重 `2.0` 骤降到非云区的较小值），这会在边界区域引入很大的空间梯度不连续性，导致网络在反向传播时在该边界处产生优化不稳定，造成图像重建后的边缘扭曲。
+- **解决方案**：在计算加权 Loss 前，对提取出的 `M` mask 进行空间平均池化平滑操作，将硬边界羽化为具有渐变带的软掩膜，从而使边界区域的损失平滑过渡，消除了梯度断层导致的边缘扭曲。
+- **代码实现**：
+  - `sgm/modules/diffusionmodules/loss_cfm.py` 中的 `ConsistencyFlowMatchingLoss` 构造函数新增 `feather_mask_kernel` 参数（默认 `0` 表示不开启，通常设为大于 1 的奇数如 `7`、`11` 开启）。
+  - 在 `_get_cloud_mask` 内部，若 `feather_mask_kernel > 1`，则应用 `F.avg_pool2d` 进行空间平滑处理，并在最后 clamp 回 `[0.0, 1.0]`，从而不改变整体的掩膜数值范围。
+- **配置与实验**：
+  - 在 [cuhk_cfm.yaml](file:///c:/Users/47651/OneDrive/Data/CODE/CR/EMRDM-ODE/configs/example_training/cuhk_cfm.yaml) 和 [cuhkv2_cfm.yaml](file:///c:/Users/47651/OneDrive/Data/CODE/CR/EMRDM-ODE/configs/example_training/cuhkv2_cfm.yaml) 中已默认新增参数配置 `feather_mask_kernel: 7`，默认激活此项平滑优化。
