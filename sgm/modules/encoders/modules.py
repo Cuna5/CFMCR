@@ -180,6 +180,15 @@ class IndentityEmbedder(AbstractEmbModel):
 
     def forward(self, vid):
         return vid
+
+
+class DictEmbedder(AbstractEmbModel):
+    def __init__(self, output_key):
+        super().__init__()
+        self.output_key = output_key
+
+    def forward(self, x):
+        return {self.output_key: x}
     
 
 from .transformer_encoder import ImageTransformerEncoder

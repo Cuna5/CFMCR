@@ -609,6 +609,22 @@ class MappingNetwork(nn.Module):
         return x
 
 
+class AuxGlobalEncoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            apply_wd(nn.Conv2d(in_channels, hidden_channels, 3, padding=1)),
+            nn.SiLU(),
+            apply_wd(nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1)),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 # Token merging and splitting
 
 class TokenMerge(nn.Module):
@@ -1107,7 +1123,20 @@ class TemporalSpec:
 # Model class
 
 class ImageTransformerDenoiserModel(nn.Module):
-    def __init__(self, in_channels, out_channels, patch_size, levels, mapping, tanh=False, control_mode=None):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        patch_size,
+        levels,
+        mapping,
+        tanh=False,
+        control_mode=None,
+        use_aux_cond=False,
+        aux_channels=5,
+        aux_hidden_channels=64,
+        aux_global_mode="nce",
+    ):
         super(ImageTransformerDenoiserModel, self).__init__()
         assert control_mode in ['sum', 'conv', 'lerp', None], "control_mode must be in ['sum','conv','lerp',None]"
         self.control_mode = control_mode
@@ -1116,6 +1145,16 @@ class ImageTransformerDenoiserModel(nn.Module):
         self.time_emb = layers.FourierFeatures(1, mapping.width)
         self.time_in_proj = Linear(mapping.width, mapping.width, bias=False)
         self.mapping = tag_module(MappingNetwork(mapping.depth, mapping.width, mapping.d_ff, dropout=mapping.dropout), "mapping")
+        self.use_aux_cond = use_aux_cond
+        self.aux_global_mode = aux_global_mode
+        if self.use_aux_cond:
+            if self.aux_global_mode != "nce":
+                raise ValueError(f"unsupported aux_global_mode {self.aux_global_mode}")
+            self.aux_global = AuxGlobalEncoder(aux_channels, aux_hidden_channels)
+            self.aux_to_cond = tag_module(
+                apply_wd(zero_init(Linear(aux_hidden_channels, mapping.width, bias=False))),
+                "mapping",
+            )
 
         self.down_levels, self.up_levels = nn.ModuleList(), nn.ModuleList()
         if control_mode == "conv":
@@ -1166,7 +1205,7 @@ class ImageTransformerDenoiserModel(nn.Module):
         ]
         return groups
 
-    def forward(self, x, timesteps, control = None):
+    def forward(self, x, timesteps, control = None, aux_cond=None):
         # Patching
         if control is not None:
             assert isinstance(control, list), "control must be a list!"
@@ -1179,6 +1218,11 @@ class ImageTransformerDenoiserModel(nn.Module):
         c_noise = timesteps # 外面处理过了
         time_emb = self.time_in_proj(self.time_emb(c_noise[..., None]))
         cond = self.mapping(time_emb)
+        if self.use_aux_cond and aux_cond is not None:
+            if aux_cond.ndim != 4:
+                raise ValueError(f"aux_cond must be BCHW, got shape {tuple(aux_cond.shape)}")
+            aux_cond = aux_cond.to(device=cond.device, dtype=cond.dtype)
+            cond = cond + self.aux_to_cond(self.aux_global(aux_cond))
 
         # Hourglass transformer
         skips, poses = [], []
@@ -1379,7 +1423,11 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
         mapping_d_ff=512,
         mapping_dropout_rate=0.0,
         tanh=False,
-        control_mode=None
+        control_mode=None,
+        use_aux_cond=False,
+        aux_channels=5,
+        aux_hidden_channels=64,
+        aux_global_mode="nce",
     ):
         assert len(widths) == len(depths)
         assert len(widths) == len(d_ffs)
@@ -1400,7 +1448,19 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
                     raise ValueError(f'unsupported self attention type {self_attn["type"]}')
                 levels.append(LevelSpec(depth, width, d_ff, self_attn, dropout))
         mapping = MappingSpec(mapping_depth, mapping_width, mapping_d_ff, mapping_dropout_rate)
-        super().__init__(in_channels, out_channels, patch_size, levels, mapping, tanh, control_mode)
+        super().__init__(
+            in_channels,
+            out_channels,
+            patch_size,
+            levels,
+            mapping,
+            tanh,
+            control_mode,
+            use_aux_cond,
+            aux_channels,
+            aux_hidden_channels,
+            aux_global_mode,
+        )
 
 class ImageTemporalTransformerDenoiserInterface(ImageTemporalTransformerDenoiserModel):
     def __init__(
