@@ -14,6 +14,7 @@ model:
   params:
     input_key: "label"
     mean_key:  "cond_image"
+    log_keys: ["cond_image"]
     compile_model: False
     use_flash_attn2: False
     image_metrics: "evaluator"
@@ -54,6 +55,10 @@ model:
         mapping_width: 768
         mapping_d_ff: 1536
         mapping_dropout_rate: 0.1
+        use_aux_cond: true
+        aux_channels: 5
+        aux_hidden_channels: 64
+        aux_global_mode: "nce"
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner
@@ -63,6 +68,12 @@ model:
             input_key: "cond_image"
             ucg_rate: 0.0
             target: sgm.modules.encoders.modules.IndentityEmbedder
+          - is_trainable: False
+            input_key: "aux_cond"
+            ucg_rate: 0.0
+            target: sgm.modules.encoders.modules.DictEmbedder
+            params:
+              output_key: "aux_cond"
 
     first_stage_config:
       target: sgm.models.autoencoder.IdentityFirstStage

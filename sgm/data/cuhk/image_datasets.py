@@ -8,6 +8,7 @@ import os
 from torch.utils import data
 from sgm.data.cuhk.imgproc import imresize
 import skimage.io as io
+from scipy import ndimage
 
 class TrainDataset(data.Dataset):
 
@@ -57,6 +58,25 @@ class TrainDataset(data.Dataset):
 
         return np.ascontiguousarray(t), np.ascontiguousarray(x)
 
+    @staticmethod
+    def _sobel_edges(image):
+        edge_x = ndimage.sobel(image, axis=1, mode="reflect")
+        edge_y = ndimage.sobel(image, axis=0, mode="reflect")
+        return np.sqrt(edge_x * edge_x + edge_y * edge_y)
+
+    @classmethod
+    def _build_aux_cond(cls, cond_image):
+        rgbnir = (np.clip(cond_image, -1.0, 1.0) + 1.0) * 0.5
+        red = rgbnir[..., 0:1]
+        rgb = rgbnir[..., 0:3]
+        nir = rgbnir[..., 3:4]
+
+        ndvi = (nir - red) / (nir + red + 1e-4)
+        edge_rgb = cls._sobel_edges(rgb)
+        edge_nir = cls._sobel_edges(nir)
+        aux_cond = np.concatenate([ndvi, edge_rgb, edge_nir], axis=2)
+        return aux_cond.astype(np.float32).transpose(2, 0, 1)
+
     def __getitem__(self, index):
         # a dataset contain 4 bands. it read the nir band and RGB band separately
         t = io.imread(os.path.join(self.datasets_dir, 'label', str(self.imlistl[index]))).astype(np.float32)
@@ -79,6 +99,7 @@ class TrainDataset(data.Dataset):
         
         x = (x / 255) * 2 - 1
         t = (t / 255) * 2 - 1
+        aux_cond = self._build_aux_cond(x)
         x = x.transpose(2, 0, 1)
         t = t.transpose(2, 0, 1)
         cloudy = x[:3,...]
@@ -87,6 +108,7 @@ class TrainDataset(data.Dataset):
         return {
             "cloudy": cloudy,
             "cond_image": x,
+            "aux_cond": aux_cond,
             "label": t,
             "M": M,
             "image_path": filename + ".png"
