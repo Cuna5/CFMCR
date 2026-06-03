@@ -428,151 +428,70 @@ sampler_config:
 - LPIPS / DCT / 边缘 loss：可能改善视觉观感，但对 PSNR / RMSE 不一定友好，先不作为主线。
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
-## V2.0版本说明
+## V2.1版本说明
 
-V2.0 同步 `NIR_ME_CFM方案V3.md` 中的创新点 1：`NCB`
-（NIR-guided Conditional Backbone）。本次只落地 NCB，不改 CFM 的
-loss / sampler / denoiser / Engine，也不改变主干输入的 `in_channels=8`。
+V2.1 在 V2.0 的 NCB-only 基础上，只引入 **Sobel edge 归一化**。本次不改变 CFM loss、sampler、denoiser 主流程，也不引入 TMM / MEF，目的是先修复 V2.0 中 edge 辅助条件尺度不稳定的问题。
 
-### 1. NCB 数据条件
+### 1. 修复动机
 
-从推理阶段可获得的含云 RGBNIR 条件图 `cond_image` 派生辅助条件：
+V2.0 的 `aux_cond` 由以下 5 个通道组成：
 
 ```text
-cond_image: [B, 4, H, W], range [-1, 1]
-aux_cond:   [B, 5, H, W]
+aux_cond = [NDVI, Edge_RGB, Edge_NIR]
 ```
 
-`aux_cond` 的 5 个通道为：
+其中：
+
+- `NDVI` 的数值范围相对稳定，理论上主要落在 `[-1, 1]`。
+- `Edge_RGB` / `Edge_NIR` 来自 Sobel 梯度幅值，尺度会随图像亮度、云层边界、地物反差变化。
+
+如果不做归一化，Sobel edge 可能在 `aux_cond` 中占据过大的数值尺度，导致 NCB 优先学习边缘信号。由于含云图中的强边缘往往包括云边界，这会增加模型把云边缘误当成地物边缘的风险，进而造成恢复结果边界漂移、纹理异常或指标下降。
+
+### 2. 实现方式
+
+在 `sgm/data/cuhk/image_datasets.py` 中新增 `_normalize_edge`：
+
+```python
+@staticmethod
+def _normalize_edge(edge):
+    scale = np.percentile(edge, 95, axis=(0, 1), keepdims=True)
+    edge = edge / (scale + 1e-4)
+    return np.clip(edge, 0.0, 1.0)
+```
+
+`_build_aux_cond` 中同步调整为：
+
+```python
+ndvi = np.clip((nir - red) / (nir + red + 1e-4), -1.0, 1.0)
+edge_rgb = cls._normalize_edge(cls._sobel_edges(rgb))
+edge_nir = cls._normalize_edge(cls._sobel_edges(nir))
+aux_cond = np.concatenate([ndvi, edge_rgb, edge_nir], axis=2)
+```
+
+归一化后 `aux_cond` 通道数仍为 5：
 
 ```text
-NDVI_cloudy + Edge_R + Edge_G + Edge_B + Edge_NIR
+1 channel NDVI + 3 channels Edge_RGB + 1 channel Edge_NIR
 ```
 
-实现位置：
+因此配置中的 `aux_channels: 5` 不需要修改。
+
+### 3. 实验建议
+
+V2.1 仍然只建议作为 NCB 消融实验，不建议同时打开 TMM / MEF。推荐顺序：
 
 ```text
-sgm/data/cuhk/image_datasets.py
+Baseline CFM
+-> V2.0 NCB without edge normalization
+-> V2.1 NCB with edge normalization
+-> V2.1 NDVI-only ablation
 ```
 
-关键约束：
+如果 V2.1 相比 V2.0 有改善，但仍低于 Baseline CFM，优先继续检查 edge 是否引入了云边缘干扰，而不是直接扩大 `aux_hidden_channels` 或加入更复杂的 TMM / MEF。
 
-- `aux_cond` 只由含云 `cond_image` 构造，不使用真实 label。
-- 当前 dataloader 中的 `M` 仍只用于 loss weighting，不进入 NCB，避免真值泄漏。
-- `aux_cond` 在数据增强之后、归一化到 `[-1, 1]` 之后生成，保证和 `cond_image / label` 空间对齐。
+### 4. 预期作用
 
-### 2. 条件注入方式
-
-新增 `DictEmbedder`，让 `aux_cond` 作为独立 key 进入网络，而不是拼到
-`concat` 条件里：
-
-```text
-sgm/modules/encoders/modules.py
-```
-
-配置中新增：
-
-```yaml
-- is_trainable: False
-  input_key: "aux_cond"
-  ucg_rate: 0.0
-  target: sgm.modules.encoders.modules.DictEmbedder
-  params:
-    output_key: "aux_cond"
-```
-
-这样主干输入仍保持：
-
-```text
-cat(x_t, cond_image) -> [B, 8, H, W]
-```
-
-`CloudRemovalWrapper` 已经会把非 `"concat"` 的条件继续透传给网络，因此本次无需修改 wrapper。
-
-### 3. NIR-guided Conditional Backbone
-
-在 Hourglass Transformer 中新增轻量全局辅助编码器：
-
-```text
-sgm/modules/diffusionmodules/k_diffusion/image_transformer.py
-```
-
-数据流：
-
-```text
-aux_cond -> AuxGlobalEncoder -> aux_global
-time_emb -> MappingNetwork -> cond
-cond' = cond + aux_to_cond(aux_global)
-```
-
-其中 `aux_to_cond` 使用 zero-init：
-
-```text
-init(aux_to_cond.weight) = 0
-```
-
-因此从旧 CFM checkpoint 热启动时，初始状态下：
-
-```text
-cond' = cond
-```
-
-新增模块不会破坏原模型行为，训练开始后再逐步学习 NDVI / Edge 对 backbone 条件调制的贡献。
-
-### 4. 配置同步
-
-以下两个 CFM 配置已打开 NCB only：
-
-```text
-configs/example_training/cuhk_cfm.yaml
-configs/example_training/cuhkv2_cfm.yaml
-```
-
-新增网络参数：
-
-```yaml
-network_config:
-  params:
-    use_aux_cond: true
-    aux_channels: 5
-    aux_hidden_channels: 64
-    aux_global_mode: "nce"
-```
-
-同时增加：
-
-```yaml
-log_keys: ["cond_image"]
-```
-
-原因是 `aux_cond` 为 5 通道，不适合走默认图片日志保存流程；日志仍只记录原有含云条件图。
-
-### 5. 当前验证状态
-
-已完成轻量验证：
-
-```text
-python -m compileall
-YAML 解析和关键字段检查
-aux_cond helper 输出形状检查: (5, H, W)
-```
-
-完整模型前向在当前本机 Python 环境中未完成，原因是环境缺少
-`pkg_resources / einops` 等依赖；这属于本地依赖问题，不是本次代码语法问题。
-
-### 6. 后续训练建议
-
-V2.0 建议先只跑 NCB 消融，不同时打开 TMM / MEF：
-
-```text
-Baseline CFM -> +NCB
-```
-
-推荐从稳定 CFM checkpoint 微调，优先观察：
-
-```text
-RMSE / PSNR / SSIM
-云区边缘、农田边界、水体岸线、建筑轮廓
-```
-
-若 NCB 指标和视觉趋势稳定，再继续接入 V3 的创新点 2：TMM。
+- 稳定 `Edge_RGB` / `Edge_NIR` 的数值尺度。
+- 降低 Sobel edge 压过 NDVI 的风险。
+- 减少不同样本之间 edge 强度差异造成的训练震荡。
+- 为后续判断 NCB 是否有效提供更干净的消融条件。
