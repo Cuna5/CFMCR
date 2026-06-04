@@ -625,6 +625,54 @@ class AuxGlobalEncoder(nn.Module):
         return self.net(x)
 
 
+class AuxTimeModulatedGlobalEncoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels, gate_hidden_channels=32):
+        super().__init__()
+        if in_channels != 5:
+            raise ValueError(f"TMM expects 5 aux channels [NDVI, Edge_RGB, Edge_NIR], got {in_channels}")
+
+        ndvi_channels = max(1, hidden_channels // 4)
+        edge_channels = hidden_channels - ndvi_channels
+        if edge_channels <= 0:
+            raise ValueError(f"hidden_channels must be greater than {ndvi_channels}, got {hidden_channels}")
+
+        self.ndvi_enc = nn.Sequential(
+            apply_wd(nn.Conv2d(1, ndvi_channels, 3, padding=1)),
+            nn.SiLU(),
+            apply_wd(nn.Conv2d(ndvi_channels, ndvi_channels, 3, padding=1)),
+            nn.SiLU(),
+        )
+        self.edge_enc = nn.Sequential(
+            apply_wd(nn.Conv2d(4, edge_channels, 3, padding=1)),
+            nn.SiLU(),
+            apply_wd(nn.Conv2d(edge_channels, edge_channels, 3, padding=1)),
+            nn.SiLU(),
+        )
+        self.time_gate = nn.Sequential(
+            apply_wd(Linear(1, gate_hidden_channels)),
+            nn.SiLU(),
+            apply_wd(Linear(gate_hidden_channels, 2)),
+        )
+        zero_init(self.time_gate[-1])
+
+    def forward(self, x, c_noise):
+        if x.shape[1] != 5:
+            raise ValueError(f"TMM expects aux_cond with 5 channels, got {x.shape[1]}")
+
+        ndvi = x[:, 0:1]
+        edge = x[:, 1:5]
+
+        gate_in = c_noise.reshape(c_noise.shape[0], -1)[:, :1].to(device=x.device, dtype=x.dtype)
+        gates = torch.sigmoid(self.time_gate(gate_in))
+        w_ndvi = gates[:, 0:1, None, None]
+        w_edge = gates[:, 1:2, None, None]
+
+        f_ndvi = self.ndvi_enc(ndvi) * w_ndvi
+        f_edge = self.edge_enc(edge) * w_edge
+        f = torch.cat([f_ndvi, f_edge], dim=1)
+        return F.adaptive_avg_pool2d(f, 1).flatten(1)
+
+
 # Token merging and splitting
 
 class TokenMerge(nn.Module):
@@ -1136,6 +1184,7 @@ class ImageTransformerDenoiserModel(nn.Module):
         aux_channels=5,
         aux_hidden_channels=64,
         aux_global_mode="nce",
+        aux_tmm_gate_hidden_channels=32,
     ):
         super(ImageTransformerDenoiserModel, self).__init__()
         assert control_mode in ['sum', 'conv', 'lerp', None], "control_mode must be in ['sum','conv','lerp',None]"
@@ -1148,9 +1197,16 @@ class ImageTransformerDenoiserModel(nn.Module):
         self.use_aux_cond = use_aux_cond
         self.aux_global_mode = aux_global_mode
         if self.use_aux_cond:
-            if self.aux_global_mode != "nce":
+            if self.aux_global_mode not in ("nce", "tmm"):
                 raise ValueError(f"unsupported aux_global_mode {self.aux_global_mode}")
-            self.aux_global = AuxGlobalEncoder(aux_channels, aux_hidden_channels)
+            if self.aux_global_mode == "nce":
+                self.aux_global = AuxGlobalEncoder(aux_channels, aux_hidden_channels)
+            else:
+                self.aux_global = AuxTimeModulatedGlobalEncoder(
+                    aux_channels,
+                    aux_hidden_channels,
+                    gate_hidden_channels=aux_tmm_gate_hidden_channels,
+                )
             self.aux_to_cond = tag_module(
                 apply_wd(zero_init(Linear(aux_hidden_channels, mapping.width, bias=False))),
                 "mapping",
@@ -1222,7 +1278,11 @@ class ImageTransformerDenoiserModel(nn.Module):
             if aux_cond.ndim != 4:
                 raise ValueError(f"aux_cond must be BCHW, got shape {tuple(aux_cond.shape)}")
             aux_cond = aux_cond.to(device=cond.device, dtype=cond.dtype)
-            cond = cond + self.aux_to_cond(self.aux_global(aux_cond))
+            if self.aux_global_mode == "tmm":
+                aux_feat = self.aux_global(aux_cond, c_noise)
+            else:
+                aux_feat = self.aux_global(aux_cond)
+            cond = cond + self.aux_to_cond(aux_feat)
 
         # Hourglass transformer
         skips, poses = [], []
@@ -1428,6 +1488,7 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
         aux_channels=5,
         aux_hidden_channels=64,
         aux_global_mode="nce",
+        aux_tmm_gate_hidden_channels=32,
     ):
         assert len(widths) == len(depths)
         assert len(widths) == len(d_ffs)
@@ -1460,6 +1521,7 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
             aux_channels,
             aux_hidden_channels,
             aux_global_mode,
+            aux_tmm_gate_hidden_channels,
         )
 
 class ImageTemporalTransformerDenoiserInterface(ImageTemporalTransformerDenoiserModel):

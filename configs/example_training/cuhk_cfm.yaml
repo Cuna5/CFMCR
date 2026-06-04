@@ -66,7 +66,8 @@ model:
         use_aux_cond: true
         aux_channels: 5
         aux_hidden_channels: 64
-        aux_global_mode: "nce"
+        aux_global_mode: "tmm"
+        aux_tmm_gate_hidden_channels: 32
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner

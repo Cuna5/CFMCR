@@ -64,12 +64,6 @@ class TrainDataset(data.Dataset):
         edge_y = ndimage.sobel(image, axis=0, mode="reflect")
         return np.sqrt(edge_x * edge_x + edge_y * edge_y)
 
-    @staticmethod
-    def _normalize_edge(edge):
-        scale = np.percentile(edge, 95, axis=(0, 1), keepdims=True)
-        edge = edge / (scale + 1e-4)
-        return np.clip(edge, 0.0, 1.0)
-
     @classmethod
     def _build_aux_cond(cls, cond_image):
         rgbnir = (np.clip(cond_image, -1.0, 1.0) + 1.0) * 0.5
@@ -77,9 +71,9 @@ class TrainDataset(data.Dataset):
         rgb = rgbnir[..., 0:3]
         nir = rgbnir[..., 3:4]
 
-        ndvi = np.clip((nir - red) / (nir + red + 1e-4), -1.0, 1.0)
-        edge_rgb = cls._normalize_edge(cls._sobel_edges(rgb))
-        edge_nir = cls._normalize_edge(cls._sobel_edges(nir))
+        ndvi = (nir - red) / (nir + red + 1e-4)
+        edge_rgb = cls._sobel_edges(rgb)
+        edge_nir = cls._sobel_edges(nir)
         aux_cond = np.concatenate([ndvi, edge_rgb, edge_nir], axis=2)
         return aux_cond.astype(np.float32).transpose(2, 0, 1)
 

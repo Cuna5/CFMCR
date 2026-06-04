@@ -428,70 +428,122 @@ sampler_config:
 - LPIPS / DCT / 边缘 loss：可能改善视觉观感，但对 PSNR / RMSE 不一定友好，先不作为主线。
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
-## V2.1版本说明
+## V2.2版本说明
+1. 还原2.1版本改动
+2. V2.2 在 V2.0 的 NCB-only 基础上加入 **TMM（Time-aware Multimodal Modulation）**。本次仍不改 CFM loss、sampler、mean path 和主干输入通道，只在 `aux_cond` 的全局条件注入前增加 CFM 时间感知门控。
 
-V2.1 在 V2.0 的 NCB-only 基础上，只引入 **Sobel edge 归一化**。本次不改变 CFM loss、sampler、denoiser 主流程，也不引入 TMM / MEF，目的是先修复 V2.0 中 edge 辅助条件尺度不稳定的问题。
+### 1. 改动目标
 
-### 1. 修复动机
-
-V2.0 的 `aux_cond` 由以下 5 个通道组成：
-
-```text
-aux_cond = [NDVI, Edge_RGB, Edge_NIR]
-```
-
-其中：
-
-- `NDVI` 的数值范围相对稳定，理论上主要落在 `[-1, 1]`。
-- `Edge_RGB` / `Edge_NIR` 来自 Sobel 梯度幅值，尺度会随图像亮度、云层边界、地物反差变化。
-
-如果不做归一化，Sobel edge 可能在 `aux_cond` 中占据过大的数值尺度，导致 NCB 优先学习边缘信号。由于含云图中的强边缘往往包括云边界，这会增加模型把云边缘误当成地物边缘的风险，进而造成恢复结果边界漂移、纹理异常或指标下降。
-
-### 2. 实现方式
-
-在 `sgm/data/cuhk/image_datasets.py` 中新增 `_normalize_edge`：
-
-```python
-@staticmethod
-def _normalize_edge(edge):
-    scale = np.percentile(edge, 95, axis=(0, 1), keepdims=True)
-    edge = edge / (scale + 1e-4)
-    return np.clip(edge, 0.0, 1.0)
-```
-
-`_build_aux_cond` 中同步调整为：
-
-```python
-ndvi = np.clip((nir - red) / (nir + red + 1e-4), -1.0, 1.0)
-edge_rgb = cls._normalize_edge(cls._sobel_edges(rgb))
-edge_nir = cls._normalize_edge(cls._sobel_edges(nir))
-aux_cond = np.concatenate([ndvi, edge_rgb, edge_nir], axis=2)
-```
-
-归一化后 `aux_cond` 通道数仍为 5：
+V2.0 中 NCB 将 `aux_cond = [NDVI, Edge_RGB, Edge_NIR]` 直接编码为一个全局条件向量，再注入 Mapping `cond`。这种固定强度注入存在一个问题：CFM 不同时间阶段对辅助信息的需求不同。
 
 ```text
-1 channel NDVI + 3 channels Edge_RGB + 1 channel Edge_NIR
+接近含云图阶段：更需要 NIR / NDVI 的全局结构提示
+中间阶段：需要 NDVI 和 Edge 共同修正云区与地物边界
+接近干净图阶段：更需要 Edge_RGB / Edge_NIR 的边界细化提示
 ```
 
-因此配置中的 `aux_channels: 5` 不需要修改。
+TMM 的目标是让模型根据当前 CFM 时间步动态调节 NDVI 与 Edge 的贡献，而不是在所有时间步使用同一套固定权重。
 
-### 3. 实验建议
+### 2. 当前实现
 
-V2.1 仍然只建议作为 NCB 消融实验，不建议同时打开 TMM / MEF。推荐顺序：
+新增模块位于：
+
+```text
+sgm/modules/diffusionmodules/k_diffusion/image_transformer.py
+```
+
+核心模块：
+
+```python
+class AuxTimeModulatedGlobalEncoder(nn.Module):
+    ...
+```
+
+它将 `aux_cond` 拆成两类：
+
+```text
+NDVI     = aux_cond[:, 0:1]
+Edge cue = aux_cond[:, 1:5]  # Edge_RGB + Edge_NIR
+```
+
+并用 CFM 网络实际收到的 `timesteps`，即 `c_noise`，生成两个门控权重：
+
+```text
+[w_ndvi(t), w_edge(t)] = sigmoid(MLP(c_noise))
+```
+
+然后得到时间调制后的全局辅助特征：
+
+```text
+F_aux(t) = GlobalPool(
+    concat(
+        w_ndvi(t) * Enc_ndvi(NDVI),
+        w_edge(t) * Enc_edge(Edge_RGB, Edge_NIR)
+    )
+)
+```
+
+最终仍通过 zero-init 的 `aux_to_cond` 注入 Mapping 条件：
+
+```text
+cond' = cond + aux_to_cond(F_aux(t))
+```
+
+由于 `aux_to_cond` 仍然 zero-init，新增 TMM 分支在训练初始时保持近似热启动等价。TMM 的 gate 最后一层也初始化为 0，使初始门控为：
+
+```text
+w_ndvi = 0.5
+w_edge = 0.5
+```
+
+避免一开始就偏向 NDVI 或 Edge。
+
+### 3. 配置变更
+
+以下两个配置已从 NCB-only 切换为 NCB + TMM：
+
+```text
+configs/example_training/cuhk_cfm.yaml
+configs/example_training/cuhkv2_cfm.yaml
+```
+
+新增 / 修改参数：
+
+```yaml
+use_aux_cond: true
+aux_channels: 5
+aux_hidden_channels: 64
+aux_global_mode: "tmm"
+aux_tmm_gate_hidden_channels: 32
+```
+
+如果要回到 V2.0 NCB-only，只需要改回：
+
+```yaml
+aux_global_mode: "nce"
+```
+
+如果要回到原始 CFM，则关闭：
+
+```yaml
+use_aux_cond: false
+```
+
+### 4. 消融建议
+
+V2.2 建议只和 V2.0 / Baseline 比较，不要同时加入 MEF：
 
 ```text
 Baseline CFM
--> V2.0 NCB without edge normalization
--> V2.1 NCB with edge normalization
--> V2.1 NDVI-only ablation
+-> V2.0: NCB only, aux_global_mode="nce"
+-> V2.2: NCB + TMM, aux_global_mode="tmm"
 ```
 
-如果 V2.1 相比 V2.0 有改善，但仍低于 Baseline CFM，优先继续检查 edge 是否引入了云边缘干扰，而不是直接扩大 `aux_hidden_channels` 或加入更复杂的 TMM / MEF。
+重点观察：
 
-### 4. 预期作用
+- TMM 是否缓解 NCB 固定强度注入导致的指标下降。
+- 云区恢复是否更稳定。
+- 边界是否减少模糊或漂移。
+- 非云区是否出现额外颜色漂移。
 
-- 稳定 `Edge_RGB` / `Edge_NIR` 的数值尺度。
-- 降低 Sobel edge 压过 NDVI 的风险。
-- 减少不同样本之间 edge 强度差异造成的训练震荡。
-- 为后续判断 NCB 是否有效提供更干净的消融条件。
+如果 V2.2 仍低于 Baseline CFM，优先做 NDVI-only 或 Edge-only 消融，确认问题来自辅助特征本身，还是时间门控不足。
