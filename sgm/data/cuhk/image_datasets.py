@@ -21,6 +21,7 @@ class TrainDataset(data.Dataset):
         hflip_p=0.5,
         vflip_p=0.5,
         rot90_p=0.5,
+        aux_mode="full",
     ):
         super().__init__()
         self.isTrain = isTrain
@@ -28,6 +29,9 @@ class TrainDataset(data.Dataset):
         self.hflip_p = float(hflip_p)
         self.vflip_p = float(vflip_p)
         self.rot90_p = float(rot90_p)
+        if aux_mode not in ("full", "ndvi_only"):
+            raise ValueError(f"unsupported aux_mode {aux_mode}; expected 'full' or 'ndvi_only'")
+        self.aux_mode = aux_mode
         if(isTrain):
             self.datasets_dir = datasets_dir+'/train' #change to the path of your dataset
         else:
@@ -65,15 +69,21 @@ class TrainDataset(data.Dataset):
         return np.sqrt(edge_x * edge_x + edge_y * edge_y)
 
     @classmethod
-    def _build_aux_cond(cls, cond_image):
+    def _build_aux_cond(cls, cond_image, aux_mode="full"):
         rgbnir = (np.clip(cond_image, -1.0, 1.0) + 1.0) * 0.5
         red = rgbnir[..., 0:1]
         rgb = rgbnir[..., 0:3]
         nir = rgbnir[..., 3:4]
 
         ndvi = (nir - red) / (nir + red + 1e-4)
-        edge_rgb = cls._sobel_edges(rgb)
-        edge_nir = cls._sobel_edges(nir)
+        if aux_mode == "full":
+            edge_rgb = cls._sobel_edges(rgb)
+            edge_nir = cls._sobel_edges(nir)
+        elif aux_mode == "ndvi_only":
+            edge_rgb = np.zeros_like(rgb)
+            edge_nir = np.zeros_like(nir)
+        else:
+            raise ValueError(f"unsupported aux_mode {aux_mode}; expected 'full' or 'ndvi_only'")
         aux_cond = np.concatenate([ndvi, edge_rgb, edge_nir], axis=2)
         return aux_cond.astype(np.float32).transpose(2, 0, 1)
 
@@ -99,7 +109,7 @@ class TrainDataset(data.Dataset):
         
         x = (x / 255) * 2 - 1
         t = (t / 255) * 2 - 1
-        aux_cond = self._build_aux_cond(x)
+        aux_cond = self._build_aux_cond(x, self.aux_mode)
         x = x.transpose(2, 0, 1)
         t = t.transpose(2, 0, 1)
         cloudy = x[:3,...]
