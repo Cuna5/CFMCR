@@ -58,7 +58,7 @@ model:
         use_aux_cond: true
         aux_channels: 5
         aux_hidden_channels: 64
-        aux_global_mode: "tmm"
+        aux_global_mode: "nce"
         aux_tmm_gate_hidden_channels: 32
 
     conditioner_config:
@@ -156,6 +156,7 @@ data:
         hflip_p: 0.5
         vflip_p: 0.5
         rot90_p: 0.5
+        aux_mode: "ndvi_only"
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -163,6 +164,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
+        aux_mode: "ndvi_only"
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -170,6 +172,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
+        aux_mode: "full"
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -177,7 +180,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-
+        aux_mode: "full"
 lightning:
   modelcheckpoint:
     params:

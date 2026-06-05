@@ -428,122 +428,93 @@ sampler_config:
 - LPIPS / DCT / 边缘 loss：可能改善视觉观感，但对 PSNR / RMSE 不一定友好，先不作为主线。
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
-## V2.2版本说明
-1. 还原2.1版本改动
-2. V2.2 在 V2.0 的 NCB-only 基础上加入 **TMM（Time-aware Multimodal Modulation）**。本次仍不改 CFM loss、sampler、mean path 和主干输入通道，只在 `aux_cond` 的全局条件注入前增加 CFM 时间感知门控。
 
-### 1. 改动目标
+## V2.3版本说明
 
-V2.0 中 NCB 将 `aux_cond = [NDVI, Edge_RGB, Edge_NIR]` 直接编码为一个全局条件向量，再注入 Mapping `cond`。这种固定强度注入存在一个问题：CFM 不同时间阶段对辅助信息的需求不同。
+V2.3 新增数据侧 `aux_mode`，用于快速做 NCB / TMM 的辅助特征消融。本次先支持：
 
 ```text
-接近含云图阶段：更需要 NIR / NDVI 的全局结构提示
-中间阶段：需要 NDVI 和 Edge 共同修正云区与地物边界
-接近干净图阶段：更需要 Edge_RGB / Edge_NIR 的边界细化提示
+aux_mode: "full"
+aux_mode: "ndvi_only"
 ```
 
-TMM 的目标是让模型根据当前 CFM 时间步动态调节 NDVI 与 Edge 的贡献，而不是在所有时间步使用同一套固定权重。
+### 1. 实现位置
 
-### 2. 当前实现
-
-新增模块位于：
+实现位于：
 
 ```text
-sgm/modules/diffusionmodules/k_diffusion/image_transformer.py
+sgm/data/cuhk/image_datasets.py
 ```
 
-核心模块：
+`TrainDataset` 新增参数：
 
 ```python
-class AuxTimeModulatedGlobalEncoder(nn.Module):
-    ...
+aux_mode="full"
 ```
 
-它将 `aux_cond` 拆成两类：
+默认 `full` 保持原行为：
 
 ```text
-NDVI     = aux_cond[:, 0:1]
-Edge cue = aux_cond[:, 1:5]  # Edge_RGB + Edge_NIR
+aux_cond = [NDVI, Edge_RGB, Edge_NIR]
 ```
 
-并用 CFM 网络实际收到的 `timesteps`，即 `c_noise`，生成两个门控权重：
+新增 `ndvi_only` 模式：
 
 ```text
-[w_ndvi(t), w_edge(t)] = sigmoid(MLP(c_noise))
+aux_cond = [NDVI, 0, 0]
 ```
 
-然后得到时间调制后的全局辅助特征：
+注意：`ndvi_only` 仍然保持 5 通道输出，只是将 `Edge_RGB` 和 `Edge_NIR` 置零。因此模型侧配置仍然保持：
 
-```text
-F_aux(t) = GlobalPool(
-    concat(
-        w_ndvi(t) * Enc_ndvi(NDVI),
-        w_edge(t) * Enc_edge(Edge_RGB, Edge_NIR)
-    )
-)
+```yaml
+aux_channels: 5
 ```
 
-最终仍通过 zero-init 的 `aux_to_cond` 注入 Mapping 条件：
+不需要修改 NCB / TMM 的网络结构。
 
-```text
-cond' = cond + aux_to_cond(F_aux(t))
-```
+### 2. 当前配置
 
-由于 `aux_to_cond` 仍然 zero-init，新增 TMM 分支在训练初始时保持近似热启动等价。TMM 的 gate 最后一层也初始化为 0，使初始门控为：
-
-```text
-w_ndvi = 0.5
-w_edge = 0.5
-```
-
-避免一开始就偏向 NDVI 或 Edge。
-
-### 3. 配置变更
-
-以下两个配置已从 NCB-only 切换为 NCB + TMM：
+以下两个 CFM 配置已设置为 NDVI-only 消融：
 
 ```text
 configs/example_training/cuhk_cfm.yaml
 configs/example_training/cuhkv2_cfm.yaml
 ```
 
-新增 / 修改参数：
+每个 split 均加入：
 
 ```yaml
-use_aux_cond: true
-aux_channels: 5
-aux_hidden_channels: 64
-aux_global_mode: "tmm"
-aux_tmm_gate_hidden_channels: 32
+aux_mode: "ndvi_only"
 ```
 
-如果要回到 V2.0 NCB-only，只需要改回：
-
-```yaml
-aux_global_mode: "nce"
-```
-
-如果要回到原始 CFM，则关闭：
-
-```yaml
-use_aux_cond: false
-```
-
-### 4. 消融建议
-
-V2.2 建议只和 V2.0 / Baseline 比较，不要同时加入 MEF：
+包括：
 
 ```text
-Baseline CFM
--> V2.0: NCB only, aux_global_mode="nce"
--> V2.2: NCB + TMM, aux_global_mode="tmm"
+train
+validation
+test
+predict
 ```
 
-重点观察：
+### 3. 实验目的
 
-- TMM 是否缓解 NCB 固定强度注入导致的指标下降。
-- 云区恢复是否更稳定。
-- 边界是否减少模糊或漂移。
-- 非云区是否出现额外颜色漂移。
+当前 Edge cue 来自含云图 Sobel 边缘，可能包含大量云边缘。如果 `full` 模式效果差，而 `ndvi_only` 更稳，说明 Edge_RGB / Edge_NIR 很可能是负收益源。
 
-如果 V2.2 仍低于 Baseline CFM，优先做 NDVI-only 或 Edge-only 消融，确认问题来自辅助特征本身，还是时间门控不足。
+推荐对比：
+
+```text
+Baseline CFM:
+  use_aux_cond: false
+
+NCB/TMM full:
+  use_aux_cond: true
+  aux_global_mode: "tmm"
+  aux_mode: "full"
+
+NCB/TMM NDVI-only:
+  use_aux_cond: true
+  aux_global_mode: "tmm"
+  aux_mode: "ndvi_only"
+```
+
+如果 NDVI-only 仍然没有收益，应优先回到 Baseline CFM 优化 loss / mask / sampler，而不是继续增强 Edge 分支。

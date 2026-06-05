@@ -172,6 +172,7 @@ data:
         hflip_p: 0.5
         vflip_p: 0.5
         rot90_p: 0.5
+        aux_mode: "ndvi_only"
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -179,6 +180,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
+        aux_mode: "ndvi_only"
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -186,6 +188,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
+        aux_mode: "ndvi_only"
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -193,6 +196,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR1"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
+        aux_mode: "ndvi_only"
 
 lightning:
   modelcheckpoint:
