@@ -429,92 +429,89 @@ sampler_config:
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
 
-## V2.3版本说明
+## V2.4版本说明
+1. 可视化云掩膜
 
-V2.3 新增数据侧 `aux_mode`，用于快速做 NCB / TMM 的辅助特征消融。本次先支持：
+---
 
-```text
-aux_mode: "full"
-aux_mode: "ndvi_only"
-```
+## V2.4：MeanFlow-CR + 云概率软合成
 
-### 1. 实现位置
+本轮按「MeanFlow 平均速度恢复流（主创新）+ 云概率头 + 推理期软合成（第二贡献）」
+落地，目标 CV 顶会叙事。文献依据：Geng et al., *Mean Flows for One-step
+Generative Modeling*（NeurIPS 2025）。
 
-实现位于：
+### Part 0：掩膜修复 + 分区评估
 
-```text
-sgm/data/cuhk/image_datasets.py
-```
+1. **云掩膜 M 改为绝对差**（`sgm/data/cuhk/image_datasets.py`）：
 
-`TrainDataset` 新增参数：
+   $$M=\mathrm{clip}\!\left(\frac{\mathrm{mean}_c|x-t|}{255}\cdot k,\,0,\,1\right),\quad k=\texttt{mask\_gain}=4.0$$
 
-```python
-aux_mode="full"
-```
+   旧公式把云阴影（比 label 暗）clip 成 0，导致 non-cloud identity loss 把阴影区
+   拉向退化输入。`tools/visualize_cuhk_mask.py` 增加 `--mask-gain` 用于标定。
+2. **分区评估**（`sgm/modules/learning/evaluator.py`）：`img_metrics` 支持
+   `mask` 参数，新增 `PSNR/SSIM/RMSE_cloudy` 与 `_cloudfree` 六个指标；
+   `shared_test_step` / `predict_step` 自动传入 `batch["M"]`（阈值 0.1）。
+   `final_*` 聚合同步扩展，无云样本的 NaN 自动跳过。
 
-默认 `full` 保持原行为：
+### Part 1：云概率头 + 软合成（B1 消融）
 
-```text
-aux_cond = [NDVI, Edge_RGB, Edge_NIR]
-```
+- 网络（`image_transformer.py`）：`predict_cloud_mask: true` 在 `out_norm` 后
+  并联 1 通道 zero-init 头，logits 经 `last_mask_logits` 属性暴露，
+  不改 denoiser 调用链、不破坏旧 checkpoint。
+- 损失（`loss_cfm.py` / `loss_meanflow.py`）：`cloud_mask_pred_loss_weight`
+  （soft-BCE 对 M）。**注意：开了头必须 >0，否则 DDP unused-parameter 报错。**
+- 采样器（`sampling_cfm.py`）：`mask_composite: true` 时
+  $x_{final}=(1-\hat m)\,\mu+\hat m\,x_{pred}$，非云区像素直接还原；
+  `clamp_output: true` 落实输出 clamp 兜底。TTA 路径自动兼容。
 
-新增 `ndvi_only` 模式：
+### Part 2：MeanFlow 目标（M0/M1 消融）
 
-```text
-aux_cond = [NDVI, 0, 0]
-```
+网络预测跳跃区间 $[s,T]$ 的**平均速度** $u_\theta(x_s,s,T)$（`use_dual_time: true`，
+第二路时间嵌入 zero-init）。训练目标来自 MeanFlow 恒等式（前向取向）：
 
-注意：`ndvi_only` 仍然保持 5 通道输出，只是将 `Edge_RGB` 和 `Edge_NIR` 置零。因此模型侧配置仍然保持：
+$$u(x_s,s,T)=v(x_s,s)+(T-s)\,\frac{d}{ds}u(x_s,s,T),\qquad
+\frac{du}{ds}=v\cdot\nabla_x u+\partial_s u$$
 
-```yaml
-aux_channels: 5
-```
+$$\mathcal{L}_{mf}=d\big(u_\theta,\ \mathrm{sg}[v+(T-s)\,du/ds]\big),\quad v=x_{clean}-\mu$$
 
-不需要修改 NCB / TMM 的网络结构。
+- **无 teacher、无 warmup、无离散 σ 对**；`(s,T)=(0,1)` 恰为一步推理状态
+  $x_{pred}=\mu+u_\theta(\mu,0,1)$，按 `full_pair_prob=0.35` 过采样。
+- $T=s$ 退化为速度锚点；$T=1$ 元素附加 clean endpoint / MS-SSIM / identity 监督。
+- 导数项默认 `torch.func.jvp`；natten 不支持 forward-mode AD 时用
+  `jvp_mode: "fd"`（有限差分）或把前两级换 shifted-window。
+- denoiser scaling 换 `MeanFlowScaling`（平滑 `log(t+1e-4)`，clamp 会在 s=0
+  处杀掉时间导数）。
+- 采样：`MeanFlowSampler`，一步 / 分段多步均按位移公式精确推进。
 
-### 2. 当前配置
-
-以下两个 CFM 配置已设置为 NDVI-only 消融：
-
-```text
-configs/example_training/cuhk_cfm.yaml
-configs/example_training/cuhkv2_cfm.yaml
-```
-
-每个 split 均加入：
-
-```yaml
-aux_mode: "ndvi_only"
-```
-
-包括：
+新文件 / 配置：
 
 ```text
-train
-validation
-test
-predict
+sgm/modules/diffusionmodules/loss_meanflow.py
+configs/example_training/cuhk_meanflow.yaml      (M1 完整方法)
+configs/example_training/cuhkv2_meanflow.yaml
+test_meanflow_jvp.py        JVP 可行性 + MeanFlow 冒烟测试
+test_cloud_mask_head.py     云概率头冒烟测试
 ```
 
-### 3. 实验目的
+### 消融矩阵
 
-当前 Edge cue 来自含云图 Sobel 边缘，可能包含大量云边缘。如果 `full` 模式效果差，而 `ndvi_only` 更稳，说明 Edge_RGB / Edge_NIR 很可能是负收益源。
+| 实验 | 配置 | 开关 |
+|---|---|---|
+| B0 | `cuhk_cfm.yaml` | 现状基线 |
+| B1 | B0 + 掩膜头 | `predict_cloud_mask=true, cloud_mask_pred_loss_weight=0.1, mask_composite=true` |
+| M0 | `cuhk_meanflow.yaml` 关掉掩膜头三开关 | MeanFlow 单独收益 |
+| M1 | `cuhk_meanflow.yaml` | 完整方法 |
 
-推荐对比：
+统一报告全图 + 云区 + 非云区 PSNR/SSIM/RMSE；1-step 为主、3-step 对照；
+M0/M1 建议从稳定 CFM checkpoint 热启动（`ckpt_path` + 小学习率 2e-5），
+所有新分支 zero-init，加载后初始行为与 CFM 完全一致。
 
-```text
-Baseline CFM:
-  use_aux_cond: false
+### 上服务器前的检查
 
-NCB/TMM full:
-  use_aux_cond: true
-  aux_global_mode: "tmm"
-  aux_mode: "full"
+1. `python test_meanflow_jvp.py`：确认 natten 是否支持 JVP，决定 `jvp_mode`。
+2. `python test_cloud_mask_head.py`。
+3. 用 `tools/visualize_cuhk_mask.py --mask-gain 4.0` 抽查新掩膜（特别是阴影样本）。
+4. 每配置先短训 ~500 step 看 loss 与 image logger，B1/M1 检查 m̂ 可视化与 M 对齐。
 
-NCB/TMM NDVI-only:
-  use_aux_cond: true
-  aux_global_mode: "tmm"
-  aux_mode: "ndvi_only"
-```
-
-如果 NDVI-only 仍然没有收益，应优先回到 Baseline CFM 优化 loss / mask / sampler，而不是继续增强 Edge 分支。
+另：`cuhkv2_cfm.yaml` 原 test/predict 的 `aux_mode: "full"` 与训练的
+`ndvi_only` 不一致（训练/测试条件分布错配），已统一为 `ndvi_only`。

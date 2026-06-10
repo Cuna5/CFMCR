@@ -1185,6 +1185,8 @@ class ImageTransformerDenoiserModel(nn.Module):
         aux_hidden_channels=64,
         aux_global_mode="nce",
         aux_tmm_gate_hidden_channels=32,
+        predict_cloud_mask=False,
+        use_dual_time=False,
     ):
         super(ImageTransformerDenoiserModel, self).__init__()
         assert control_mode in ['sum', 'conv', 'lerp', None], "control_mode must be in ['sum','conv','lerp',None]"
@@ -1193,6 +1195,14 @@ class ImageTransformerDenoiserModel(nn.Module):
 
         self.time_emb = layers.FourierFeatures(1, mapping.width)
         self.time_in_proj = Linear(mapping.width, mapping.width, bias=False)
+        # MeanFlow dual-time conditioning: `timesteps` stays the current time
+        # (warm-start compatible) and `timesteps_r` encodes the jump-target
+        # time of the average-velocity field u(x, s, T). zero-init projection
+        # keeps old CFM checkpoints bit-exact at load time.
+        self.use_dual_time = use_dual_time
+        if use_dual_time:
+            self.time_emb_r = layers.FourierFeatures(1, mapping.width)
+            self.time_in_proj_r = zero_init(Linear(mapping.width, mapping.width, bias=False))
         self.mapping = tag_module(MappingNetwork(mapping.depth, mapping.width, mapping.d_ff, dropout=mapping.dropout), "mapping")
         self.use_aux_cond = use_aux_cond
         self.aux_global_mode = aux_global_mode
@@ -1246,6 +1256,15 @@ class ImageTransformerDenoiserModel(nn.Module):
         self.out_norm = RMSNorm(levels[0].width)
         self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
         nn.init.zeros_(self.patch_out.proj.weight)
+        # Optional cloud-probability head sharing the final feature map. Logits
+        # are exposed via `last_mask_logits` (not a return value) so the
+        # denoiser call chain keeps its signature. zero-init => sigmoid 0.5 at
+        # start and no effect on the velocity output (checkpoint warm-start).
+        self.predict_cloud_mask = predict_cloud_mask
+        if predict_cloud_mask:
+            self.mask_out = TokenSplitWithoutSkip(levels[0].width, 1, patch_size)
+            nn.init.zeros_(self.mask_out.proj.weight)
+        self.last_mask_logits = None
         self.tanh = nn.Tanh() if tanh else nn.Identity()
 
     def param_groups(self, base_lr=5e-4, mapping_lr_scale=1 / 3):
@@ -1261,7 +1280,7 @@ class ImageTransformerDenoiserModel(nn.Module):
         ]
         return groups
 
-    def forward(self, x, timesteps, control = None, aux_cond=None):
+    def forward(self, x, timesteps, control = None, aux_cond=None, timesteps_r=None):
         # Patching
         if control is not None:
             assert isinstance(control, list), "control must be a list!"
@@ -1273,6 +1292,8 @@ class ImageTransformerDenoiserModel(nn.Module):
 
         c_noise = timesteps # 外面处理过了
         time_emb = self.time_in_proj(self.time_emb(c_noise[..., None]))
+        if self.use_dual_time and timesteps_r is not None:
+            time_emb = time_emb + self.time_in_proj_r(self.time_emb_r(timesteps_r[..., None]))
         cond = self.mapping(time_emb)
         if self.use_aux_cond and aux_cond is not None:
             if aux_cond.ndim != 4:
@@ -1327,12 +1348,16 @@ class ImageTransformerDenoiserModel(nn.Module):
 
         # Unpatching
         x = self.out_norm(x)
+        if self.predict_cloud_mask:
+            self.last_mask_logits = self.mask_out(x).movedim(-1, -3)
+        else:
+            self.last_mask_logits = None
         x = self.patch_out(x)
         x = self.tanh(x)
         x = x.movedim(-1, -3)
 
         return x
-    
+
 class ImageTemporalTransformerDenoiserModel(nn.Module):
     def __init__(
         self, 
@@ -1489,6 +1514,8 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
         aux_hidden_channels=64,
         aux_global_mode="nce",
         aux_tmm_gate_hidden_channels=32,
+        predict_cloud_mask=False,
+        use_dual_time=False,
     ):
         assert len(widths) == len(depths)
         assert len(widths) == len(d_ffs)
@@ -1522,6 +1549,8 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
             aux_hidden_channels,
             aux_global_mode,
             aux_tmm_gate_hidden_channels,
+            predict_cloud_mask,
+            use_dual_time,
         )
 
 class ImageTemporalTransformerDenoiserInterface(ImageTemporalTransformerDenoiserModel):

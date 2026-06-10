@@ -22,6 +22,7 @@ class TrainDataset(data.Dataset):
         vflip_p=0.5,
         rot90_p=0.5,
         aux_mode="full",
+        mask_gain=4.0,
     ):
         super().__init__()
         self.isTrain = isTrain
@@ -29,6 +30,7 @@ class TrainDataset(data.Dataset):
         self.hflip_p = float(hflip_p)
         self.vflip_p = float(vflip_p)
         self.rot90_p = float(rot90_p)
+        self.mask_gain = float(mask_gain)
         if aux_mode not in ("full", "ndvi_only"):
             raise ValueError(f"unsupported aux_mode {aux_mode}; expected 'full' or 'ndvi_only'")
         self.aux_mode = aux_mode
@@ -102,10 +104,10 @@ class TrainDataset(data.Dataset):
         if self.augment:
             t, x = self._augment_pair(t, x)
 
-        M = np.clip((t-x).sum(axis=2), 0, 1).astype(np.float32)
-        #M = io.imread(os.path.join(self.datasets_dir, 'mask', str(self.imlistl[index]))).astype(np.float32)
-        # M[M>0.5]=1
-        # M[M<=0.5]=0
+        # Absolute difference so cloud shadows (darker than label) are also
+        # covered; a signed/positive-only mask would clip shadows to 0 and the
+        # non-cloud identity loss would then pull them toward the degraded input.
+        M = np.clip(np.abs(x - t).mean(axis=2) / 255.0 * self.mask_gain, 0, 1).astype(np.float32)
         
         x = (x / 255) * 2 - 1
         t = (t / 255) * 2 - 1
