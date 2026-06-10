@@ -1,17 +1,26 @@
 ##############################################################################
-# EMRDM — Consistency Flow Matching (CUHK-CR1 dataset)
+# MeanFlow-CR — average-velocity restoration flow (CUHK-CR1 dataset)
 #
-# Key idea
-# --------
-# CFM uses a straight OT path plus endpoint / velocity consistency:
+# Key idea (Geng et al., "Mean Flows for One-step Generative Modeling")
+# ---------------------------------------------------------------------
+# The network predicts the AVERAGE velocity u(x_s, s, T) over a jump [s, T]
+# on the straight OT path x_s = (1-s)·μ + s·x_clean, trained teacher-free
+# with the MeanFlow identity:
 #
-#   x_t = (1-t)·μ + t·x_clean            (OT path, no extra noise)
-#   f_θ(t, x_t) = x_t + (1-t)·v_θ(x_t, t)
-#   Loss: endpoint consistency + velocity consistency + clean endpoint anchor
+#   u(x_s, s, T) = v(x_s, s) + (T - s)·d/ds u(x_s, s, T)     (JVP target)
 #
-# Training from scratch — no pre-trained checkpoint required.
-# At inference a SINGLE network call recovers the cloud-free image:
-#   x_clean ≈ μ + v_θ(μ, σ_max)
+# 1-step inference is exact by construction:
+#   x_pred = μ + u(μ, 0, 1)
+#
+# This config is the FULL method (M1): MeanFlow + cloud-probability head +
+# mask-guided composition. For the M0 ablation (MeanFlow only) set:
+#   network.predict_cloud_mask: false
+#   loss.cloud_mask_pred_loss_weight: 0.0
+#   sampler.mask_composite: false
+#
+# Warm start from a stable CFM checkpoint is recommended (uncomment
+# ckpt_path); all new branches (dual-time embedding, mask head) are
+# zero-init, so the loaded model initially behaves exactly like CFM.
 ##############################################################################
 
 model:
@@ -24,23 +33,28 @@ model:
     compile_model: False
     use_flash_attn2: False
     image_metrics: "evaluator"
-    teacher_ema_decay: 0.9999       # EMA decay for the CFM teacher model
+    # The EMA teacher is kept by the engine but NOT used by MeanFlowLoss.
+    teacher_ema_decay: 0.9999
     count_sample_time: True
     count_train_time: True
 
-    # Optional: warm-start from a CFM checkpoint.
-    # ckpt_path: "/path/to/cfm_pretrained.ckpt"
+    # Recommended: warm start from a stable CFM checkpoint (zero-init keeps
+    # the initial behaviour identical), with a reduced learning rate, e.g.
+    # base_learning_rate: 2.0e-5.
+    # ckpt_path: "/path/to/stable_cfm.ckpt"
 
     sigma_st_config:
       target: sgm.modules.diffusionmodules.sigma2st_cfm.ConsistencyFlowMatchingSigma2St
-      # s(σ) = 1 − σ = t  (no extra params)
+      # s(σ) = 1 − σ  (CFM time; unchanged)
 
     denoiser_config:
       target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
       params:
         scaling_config:
-          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
-          # c_skip=0, c_out=1, c_in=1  — raw network output IS the velocity
+          # Smooth log-time embedding so the JVP time derivative does not
+          # vanish at s=0 (the 1-step pair). Coincides with the CFM scaling
+          # for t >> 1e-4, so CFM checkpoints warm-start cleanly.
+          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.MeanFlowScaling
 
     network_wrapper: "sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper"
 
@@ -54,6 +68,11 @@ model:
         depths: [2, 2, 2, 2]
         d_ffs: [256, 512, 768, 1536]
         self_attns:
+          # NOTE: natten neighborhood attention may not support forward-mode
+          # AD (torch.func.jvp). Run `python test_meanflow_jvp.py` first; if
+          # JVP fails, either set loss jvp_mode: "fd" below, or switch the
+          # first two levels to {type: "shifted-window", d_head: 64,
+          # window_size: 8}.
           - {type: "neighborhood", d_head: 64, kernel_size: 7}
           - {type: "neighborhood", d_head: 64, kernel_size: 7}
           - {type: "global",       d_head: 64}
@@ -68,10 +87,10 @@ model:
         aux_hidden_channels: 64
         aux_global_mode: "tmm"
         aux_tmm_gate_hidden_channels: 32
-        # Cloud-probability head (zero-init, checkpoint warm-start safe).
-        # Enable together with loss cloud_mask_pred_loss_weight > 0 and
-        # sampler mask_composite (B1 ablation).
-        predict_cloud_mask: false
+        # MeanFlow dual-time conditioning (jump-target embedding, zero-init)
+        use_dual_time: true
+        # Cloud-probability head (zero-init) for mask-guided composition
+        predict_cloud_mask: true
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner
@@ -91,60 +110,61 @@ model:
     first_stage_config:
       target: sgm.models.autoencoder.IdentityFirstStage
 
-    # ── CFM consistency loss ───────────────────────────────────────────────
+    # ── MeanFlow loss (teacher-free) ───────────────────────────────────────
     loss_fn_config:
-      target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
+      target: sgm.modules.diffusionmodules.loss_meanflow.MeanFlowLoss
       params:
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
-        endpoint_loss_weight: 0.5    # teacher endpoint consistency
-        consistency_loss_weight: 0.5 # teacher velocity consistency
-        velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
-        clean_endpoint_loss_weight: 1.0  # direct fθ -> x_clean metric anchor
-        ssim_endpoint_loss_weight: 0.0   # MS-SSIM on fθ vs x_clean; scan 0.02/0.05/0.1/0.2
-        non_cloud_identity_loss_weight: 0.2  # penalise changes to clear pixels; scan 0.1/0.2/0.3
-        cloud_mask_pred_loss_weight: 0.0     # BCE for the cloud-prob head; must be >0 when predict_cloud_mask=true
-        cloud_mask_key: "M"              # CUHK dataloader cloud mask
-        cloud_loss_weight: 2.0           # cloud pixels are weighted 2x, then normalized per sample
-        cloud_weight_velocity_anchor: True
-        feather_mask_kernel: 7           # 软化云掩膜核大小（奇数，如 7 或 11），0 表示关闭，用于减少边缘扭曲
-        start_pair_prob: 0.35            # oversample σ≈1 for 1-step quality
-        # Two-stage training (Yang et al. 2024, Sec. 4.2): the endpoint /
-        # velocity consistency terms are linearly ramped up from 0 over the
-        # first `consistency_warmup_steps` updates so the student + teacher
-        # first learn a correct velocity from supervised anchors.
-        consistency_warmup_steps: 2000
-        # Number of σ levels used to sample consecutive (σ_n, σ_{n+1}) pairs.
-        # More steps → finer pairs, better coverage of the OT path.
+        # MeanFlow identity term
+        meanflow_loss_weight: 1.0
+        # (s, T) pair sampling: 0.35 exact 1-step pair (0,1), 0.25 random
+        # start with clean target (s,1), 0.15 pure velocity anchor (s,s),
+        # remaining 0.25 generic jumps for multi-step sampling.
+        full_pair_prob: 0.35
+        t1_pair_prob: 0.25
+        equal_pair_prob: 0.15
+        # "jvp" = exact torch.func.jvp; "fd" = finite-difference fallback
+        # (use if natten/flash-attn reject forward-mode AD).
+        jvp_mode: "jvp"
+        fd_eps: 1.0e-2
+        # Endpoint supervision (applied on T=1 elements only)
+        clean_endpoint_loss_weight: 1.0
+        ssim_endpoint_loss_weight: 0.0   # scan 0.02/0.05/0.1
+        non_cloud_identity_loss_weight: 0.2
+        # Cloud-probability head supervision (must be >0 when
+        # predict_cloud_mask=true, otherwise DDP unused-parameter error)
+        cloud_mask_pred_loss_weight: 0.1
+        cloud_mask_key: "M"
+        cloud_loss_weight: 2.0
+        cloud_weight_velocity_anchor: True   # also weights the MeanFlow term
+        feather_mask_kernel: 7
+        # Parent CFM parameters below are ignored by MeanFlowLoss (no EMA
+        # teacher, no discrete pair grid) but must stay valid.
+        endpoint_loss_weight: 0.0
+        consistency_loss_weight: 0.0
+        velocity_anchor_loss_weight: 0.0
+        start_pair_prob: 0.0
+        consistency_warmup_steps: 0
         num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 1.0   # σ=1 matches t=0 (start from μ); scaling clamps log
-            rho: 1       # linear σ schedule  ↔  uniform t training
+            sigma_max: 1.0
+            rho: 1
 
-    # ── 1-step CFM sampler for validation / inference ─────────────────────
+    # ── MeanFlow sampler (1-step by default) ───────────────────────────────
     sampler_config:
-      target: sgm.modules.diffusionmodules.sampling_cfm.ConsistencyFlowMatchingSampler
+      target: sgm.modules.diffusionmodules.sampling_cfm.MeanFlowSampler
       params:
-        # Set num_steps=1 for true 1-step inference; >1 uses CFM Euler steps.
         num_steps: 1
-        # Test-Time Augmentation: average 4 geometric variants (orig + hflip
-        # + vflip + hvflip).  Typically +0.1~0.3 dB PSNR at 4× inference cost.
-        # Enable via CLI: model.params.sampler_config.params.tta=True
         tta: False
-        # Stochastic churn for multi-step CFM sampling only (num_steps > 1).
-        # sigma_hat is clamped to sigma_max to avoid leaving the trained range.
-        s_churn: 0.0
-        s_tmin: 0.0
-        s_tmax: 100000000.0
-        s_noise: 1.0
         # clamp final output to [-1,1] so outlier pixels cannot hurt RMSE/PSNR
-        clamp_output: false
+        clamp_output: true
         # blend prediction with input using the predicted cloud probability:
         # x_final = (1-m)*mu + m*x_pred (requires predict_cloud_mask=true)
-        mask_composite: false
+        mask_composite: true
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
@@ -155,8 +175,6 @@ model:
     scheduler_config:
       target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
       params:
-        # Multipliers applied on top of base_learning_rate (1e-4).
-        # Warmup 0.01→1.0 over 2000 steps, then cosine decay to 0.01.
         warm_up_steps: 2000
         lr_start: 0.01
         lr_max: 1.0
@@ -183,6 +201,7 @@ data:
         vflip_p: 0.5
         rot90_p: 0.5
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -191,6 +210,7 @@ data:
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -199,6 +219,7 @@ data:
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -207,6 +228,7 @@ data:
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR1"
         isTrain: False
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
 lightning:
   modelcheckpoint:

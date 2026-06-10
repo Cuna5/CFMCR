@@ -1,11 +1,14 @@
 ##############################################################################
-# EMRDM — Consistency Flow Matching (CUHK-CR2 dataset)
+# MeanFlow-CR — average-velocity restoration flow (CUHK-CR2 dataset)
 #
-# Same CFM approach as cuhk_cfm.yaml, adapted for the CUHK-CR2 dataset:
-#   - batch_size: 1
-#   - check_val_every_n_epoch: 5
-#   - max_epochs: 2000
-#   - loss uses endpoint consistency + velocity consistency + clean endpoint anchor
+# Same MeanFlow approach as cuhk_meanflow.yaml, adapted for CUHK-CR2
+# (thick-cloud dataset): aux_global_mode "nce", longer LR decay, sparser
+# checkpointing, check_val_every_n_epoch 5 — mirroring cuhkv2_cfm.yaml.
+#
+# This config is the FULL method (M1). For the M0 ablation set:
+#   network.predict_cloud_mask: false
+#   loss.cloud_mask_pred_loss_weight: 0.0
+#   sampler.mask_composite: false
 ##############################################################################
 
 model:
@@ -18,11 +21,12 @@ model:
     compile_model: False
     use_flash_attn2: False
     image_metrics: "evaluator"
+    # The EMA teacher is kept by the engine but NOT used by MeanFlowLoss.
     teacher_ema_decay: 0.9999
     count_sample_time: True
     count_train_time: True
 
-    # Optional: warm-start from a CFM checkpoint.
+    # Recommended: warm start from a stable CFM checkpoint.
     # ckpt_path: "/path/to/cuhkv2_cfm_pretrained.ckpt"
 
     sigma_st_config:
@@ -32,7 +36,8 @@ model:
       target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
       params:
         scaling_config:
-          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
+          # Smooth log-time embedding; see cuhk_meanflow.yaml for rationale.
+          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.MeanFlowScaling
 
     network_wrapper: "sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper"
 
@@ -46,6 +51,8 @@ model:
         depths: [2, 2, 2, 2]
         d_ffs: [256, 512, 768, 1536]
         self_attns:
+          # See cuhk_meanflow.yaml: if torch.func.jvp fails with natten, set
+          # loss jvp_mode: "fd" or switch to shifted-window attention.
           - {type: "neighborhood", d_head: 64, kernel_size: 7}
           - {type: "neighborhood", d_head: 64, kernel_size: 7}
           - {type: "global",       d_head: 64}
@@ -60,10 +67,10 @@ model:
         aux_hidden_channels: 64
         aux_global_mode: "nce"
         aux_tmm_gate_hidden_channels: 32
-        # Cloud-probability head (zero-init, checkpoint warm-start safe).
-        # Enable together with loss cloud_mask_pred_loss_weight > 0 and
-        # sampler mask_composite (B1 ablation).
-        predict_cloud_mask: false
+        # MeanFlow dual-time conditioning (jump-target embedding, zero-init)
+        use_dual_time: true
+        # Cloud-probability head (zero-init) for mask-guided composition
+        predict_cloud_mask: true
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner
@@ -83,53 +90,48 @@ model:
     first_stage_config:
       target: sgm.models.autoencoder.IdentityFirstStage
 
+    # ── MeanFlow loss (teacher-free) ───────────────────────────────────────
     loss_fn_config:
-      target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
+      target: sgm.modules.diffusionmodules.loss_meanflow.MeanFlowLoss
       params:
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
-        endpoint_loss_weight: 0.5    # teacher endpoint consistency
-        consistency_loss_weight: 0.5 # teacher velocity consistency
-        velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
-        clean_endpoint_loss_weight: 1.0  # direct fθ -> x_clean metric anchor
-        ssim_endpoint_loss_weight: 0.75   # MS-SSIM on fθ vs x_clean; scan 0.02/0.05/0.1/0.2
-        non_cloud_identity_loss_weight: 0.2  # penalise changes to clear pixels; scan 0.1/0.2/0.3
-        cloud_mask_pred_loss_weight: 0.0     # BCE for the cloud-prob head; must be >0 when predict_cloud_mask=true
-        cloud_mask_key: "M"              # CUHK dataloader cloud mask
-        cloud_loss_weight: 2.0           # cloud pixels are weighted 2x, then normalized per sample
+        meanflow_loss_weight: 1.0
+        full_pair_prob: 0.35
+        t1_pair_prob: 0.25
+        equal_pair_prob: 0.15
+        jvp_mode: "jvp"
+        fd_eps: 1.0e-2
+        clean_endpoint_loss_weight: 1.0
+        ssim_endpoint_loss_weight: 0.0   # scan 0.02/0.05/0.1
+        non_cloud_identity_loss_weight: 0.2
+        cloud_mask_pred_loss_weight: 0.1
+        cloud_mask_key: "M"
+        cloud_loss_weight: 2.0
         cloud_weight_velocity_anchor: True
-        feather_mask_kernel: 7           # 软化云掩膜核大小（奇数，如 7 或 11），0 表示关闭，用于减少边缘扭曲
-        start_pair_prob: 0.35            # oversample σ≈1 for 1-step quality
-        # Two-stage warmup: disable consistency terms for the first N steps
-        # so the teacher can stabilise while supervised anchors shape velocity.
-        consistency_warmup_steps: 2000
+        feather_mask_kernel: 7
+        # Parent CFM parameters below are ignored by MeanFlowLoss.
+        endpoint_loss_weight: 0.0
+        consistency_loss_weight: 0.0
+        velocity_anchor_loss_weight: 0.0
+        start_pair_prob: 0.0
+        consistency_warmup_steps: 0
         num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 1.0   # σ=1 matches t=0; CFM scaling clamps log
+            sigma_max: 1.0
             rho: 1
 
+    # ── MeanFlow sampler (1-step by default) ───────────────────────────────
     sampler_config:
-      target: sgm.modules.diffusionmodules.sampling_cfm.ConsistencyFlowMatchingSampler
+      target: sgm.modules.diffusionmodules.sampling_cfm.MeanFlowSampler
       params:
-        num_steps: 1 # 4/7/10
-        # Test-Time Augmentation: average 4 geometric variants (orig + hflip
-        # + vflip + hvflip).  Typically +0.1~0.3 dB PSNR at 4× inference cost.
-        # Enable via CLI: model.params.sampler_config.params.tta=True
+        num_steps: 1
         tta: False
-        # Stochastic churn for multi-step CFM sampling only (num_steps > 1).
-        # sigma_hat is clamped to sigma_max to avoid leaving the trained range.
-        s_churn: 0.0
-        s_tmin: 0.0
-        s_tmax: 100000000.0
-        s_noise: 1.0
-        # clamp final output to [-1,1] so outlier pixels cannot hurt RMSE/PSNR
-        clamp_output: false
-        # blend prediction with input using the predicted cloud probability:
-        # x_final = (1-m)*mu + m*x_pred (requires predict_cloud_mask=true)
-        mask_composite: false
+        clamp_output: true
+        mask_composite: true
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
@@ -140,7 +142,6 @@ model:
     scheduler_config:
       target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
       params:
-        # Multipliers on top of base_learning_rate.
         warm_up_steps: 2000
         lr_start: 0.01
         lr_max: 1.0
@@ -167,6 +168,7 @@ data:
         vflip_p: 0.5
         rot90_p: 0.5
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -175,6 +177,7 @@ data:
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -182,9 +185,8 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-        # must match the train aux_mode, otherwise train/test aux conditions
-        # are distribution-mismatched
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -192,8 +194,9 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-        # must match the train aux_mode
         aux_mode: "ndvi_only"
+        mask_gain: 4.0
+
 lightning:
   modelcheckpoint:
     params:

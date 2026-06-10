@@ -357,6 +357,7 @@ class ResidualDiffusionEngine(DiffusionEngine):
         
         # 两种数据集的评价指标计算方式不一样，这里通过一个不大优美的方法来区分开
         assert image_metrics in ["metrics", "evaluator"], "image_metrics should be either metrics or evaluator"
+        self.image_metrics_type = image_metrics
         if image_metrics == "metrics":
             from sgm.modules.learning.metrics import img_metrics, avg_img_metrics
             self.img_metrics = img_metrics
@@ -380,6 +381,12 @@ class ResidualDiffusionEngine(DiffusionEngine):
             self.sampler.set_sigma2st(self.sigma2st)
         except:
             raise NotImplementedError("The sampler does not have set_sigma2st function, maybe you should use the residual sampler.")
+        # Give the sampler access to the wrapped network so it can read the
+        # optional cloud-probability logits for mask-guided composition.
+        # EMA scopes swap weights in-place on the same module, so this
+        # reference stays valid for validation / test inference.
+        if hasattr(self.sampler, "set_network_ref"):
+            self.sampler.set_network_ref(self.model)
         self.to_rgb_func = instantiate_from_config(to_rgb_config)
         self.count_sample_time = count_sample_time
         self.count_train_time = count_train_time
@@ -461,8 +468,10 @@ class ResidualDiffusionEngine(DiffusionEngine):
     ):
         randn = torch.randn(batch_size, *shape).to(self.device)
 
-        denoiser = lambda input, sigma, c, st: self.denoiser(
-            self.model, input, sigma, c, st, **kwargs
+        # `extra` lets samplers forward per-step kwargs to the network (e.g.
+        # the MeanFlow jump-target time `timesteps_r`).
+        denoiser = lambda input, sigma, c, st, **extra: self.denoiser(
+            self.model, input, sigma, c, st, **kwargs, **extra
         )
         if ideal_sample:
             samples = self.ideal_sampler(randn, mu, return_intermediate=return_intermediate, return_denoised=return_denoised)
@@ -661,16 +670,26 @@ class ResidualDiffusionEngine(DiffusionEngine):
                 batch_size=N,
             )
         
+        # Cloud mask enables stratified (cloudy / cloudfree) metrics. Only the
+        # evaluator-style img_metrics supports the `mask` keyword.
+        cloud_mask = None
+        if self.image_metrics_type == "evaluator" and isinstance(batch, dict):
+            cloud_mask = batch.get("M", None)
+
         for i in range(samples.shape[0]):
             _target = target[i,...]
             _samples = samples[i,...]
             _target = self.scale_01(_target)
             _samples = self.scale_01(_samples)
-            metrics = self.img_metrics(target=_target.unsqueeze(0), pred=_samples.unsqueeze(0))
+            metric_kwargs = {}
+            if cloud_mask is not None:
+                metric_kwargs["mask"] = cloud_mask[i]
+            metrics = self.img_metrics(target=_target.unsqueeze(0), pred=_samples.unsqueeze(0), **metric_kwargs)
+            metrics = {k: v for k, v in metrics.items() if not (isinstance(v, float) and math.isnan(v))}
             self.log_dict(metrics, sync_dist=True, batch_size=1, on_epoch=True)
             _mu = self.scale_01(mu[i,...])
-            raw_metrics = self.img_metrics(target=_target.unsqueeze(0), pred=_mu.unsqueeze(0))
-            raw_metrics = {"raw_" + k:v for k, v in raw_metrics.items()}
+            raw_metrics = self.img_metrics(target=_target.unsqueeze(0), pred=_mu.unsqueeze(0), **metric_kwargs)
+            raw_metrics = {"raw_" + k:v for k, v in raw_metrics.items() if not (isinstance(v, float) and math.isnan(v))}
             self.log_dict(raw_metrics, sync_dist=True, batch_size=1, on_epoch=True)
             self.avg_metrics.add(metrics)
         
@@ -772,7 +791,10 @@ class ResidualDiffusionEngine(DiffusionEngine):
         mu_rgb = np.moveaxis((self.to_rgb_func(mu)[0] * 255).cpu().numpy().astype(np.uint8),0,-1)
         Image.fromarray(mu_rgb).save(path + mu_path)
         # calculate the metrics
-        metrics = self.img_metrics(target=target, pred=samples)
+        metric_kwargs = {}
+        if self.image_metrics_type == "evaluator" and isinstance(batch, dict) and batch.get("M", None) is not None:
+            metric_kwargs["mask"] = batch["M"][0]
+        metrics = self.img_metrics(target=target, pred=samples, **metric_kwargs)
         metrics["image_path"] = image_path
         if sample_time is not None:
             metrics["sample_time"] = sample_time

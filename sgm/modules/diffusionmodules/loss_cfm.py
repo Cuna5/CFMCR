@@ -120,6 +120,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         consistency_warmup_steps: int = 0,
         ssim_endpoint_loss_weight: float = 0.0,
         non_cloud_identity_loss_weight: float = 0.0,
+        cloud_mask_pred_loss_weight: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
     ):
         super().__init__()
@@ -141,6 +142,12 @@ class ConsistencyFlowMatchingLoss(nn.Module):
         self.feather_mask_kernel = int(feather_mask_kernel)
         self.ssim_endpoint_loss_weight = float(ssim_endpoint_loss_weight)
         self.non_cloud_identity_loss_weight = float(non_cloud_identity_loss_weight)
+        # Supervision for the network's optional cloud-probability head
+        # (network_config.params.predict_cloud_mask). The label-derived mask M
+        # is a legitimate *training target*; only using it as input would leak.
+        # NOTE: when predict_cloud_mask=true this weight must be > 0, otherwise
+        # the head parameters receive no gradient (DDP unused-parameter error).
+        self.cloud_mask_pred_loss_weight = float(cloud_mask_pred_loss_weight)
         # While training from scratch the teacher is random for the first
         # few thousand steps. Linearly ramp the endpoint/velocity consistency
         # terms up from 0 so those steps are guided only by the supervised
@@ -322,6 +329,25 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             else f_student.new_zeros(B)
         )
 
+        # Cloud-probability head supervision (soft BCE against the
+        # label-derived mask M). Logits are produced by the *student* forward
+        # just above and exposed on the network module.
+        if self.cloud_mask_pred_loss_weight > 0.0:
+            mask_logits = getattr(
+                getattr(network, "diffusion_model", network),
+                "last_mask_logits",
+                None,
+            )
+            cloud_mask = self._get_cloud_mask(batch, input)
+            if mask_logits is not None and cloud_mask is not None:
+                mask_pred_loss = F.binary_cross_entropy_with_logits(
+                    mask_logits.float(), cloud_mask.float(), reduction="none"
+                ).reshape(B, -1).mean(dim=1).to(dtype=input.dtype)
+            else:
+                mask_pred_loss = f_student.new_zeros(B)
+        else:
+            mask_pred_loss = f_student.new_zeros(B)
+
         # Non-cloud identity loss: penalise changes to already-clear pixels.
         # L_id = loss((1-M)*f_student, (1-M)*x_cloudy)
         if self.non_cloud_identity_loss_weight > 0.0:
@@ -346,6 +372,7 @@ class ConsistencyFlowMatchingLoss(nn.Module):
             + self.clean_endpoint_loss_weight * clean_endpoint_loss
             + self.ssim_endpoint_loss_weight * ssim_loss
             + self.non_cloud_identity_loss_weight * identity_loss
+            + self.cloud_mask_pred_loss_weight * mask_pred_loss
         )
 
     def _get_loss(

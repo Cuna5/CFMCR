@@ -86,6 +86,8 @@ class ConsistencyFlowMatchingSampler:
         s_tmin: float = 0.0,
         s_tmax: float = float("inf"),
         s_noise: float = 1.0,
+        clamp_output: bool = False,
+        mask_composite: bool = False,
     ):
         self.num_steps = num_steps
         self.discretization = instantiate_from_config(discretization_config)
@@ -102,9 +104,44 @@ class ConsistencyFlowMatchingSampler:
         self.s_tmin = s_tmin
         self.s_tmax = s_tmax
         self.s_noise = s_noise
+        # clamp_output: clamp the final prediction to [-1, 1] so a few outlier
+        # pixels cannot drag down RMSE / PSNR.
+        self.clamp_output = clamp_output
+        # mask_composite: blend the prediction with the cloudy input using the
+        # network's predicted cloud probability (requires
+        # network_config.params.predict_cloud_mask=true):
+        #     x_final = (1 - m) * mu + m * x_pred
+        # Clear pixels are restored verbatim from the input. Not compatible
+        # with CFG guiders that duplicate the batch.
+        self.mask_composite = mask_composite
+        self._network_ref = None
 
     def set_sigma2st(self, sigma2st):
         self.sigma2st = sigma2st
+
+    def set_network_ref(self, model):
+        """Reference to the (wrapped) network so the sampler can read the
+        cloud-probability logits exposed by the last forward pass."""
+        self._network_ref = model
+
+    def _get_mask_prob(self):
+        if not self.mask_composite or self._network_ref is None:
+            return None
+        net = getattr(self._network_ref, "diffusion_model", self._network_ref)
+        logits = getattr(net, "last_mask_logits", None)
+        if logits is None:
+            return None
+        return torch.sigmoid(logits.float())
+
+    def _finalize(self, x_clean, mu):
+        """Apply optional output clamping and cloud-mask composition."""
+        if self.clamp_output:
+            x_clean = x_clean.clamp(-1.0, 1.0)
+        m = self._get_mask_prob()
+        if m is not None:
+            m = m.to(dtype=x_clean.dtype)
+            x_clean = (1.0 - m) * mu + m * x_clean
+        return x_clean
 
     def _get_sigma_gen(self, num_sigmas):
         from tqdm import tqdm
@@ -261,6 +298,8 @@ class ConsistencyFlowMatchingSampler:
             if return_denoised:
                 denoiseds.append(tools_scale(endpoint.clone().detach()))
 
+        x = self._finalize(x, mu)
+
         others = {}
         if return_intermediate:
             others["intermediates"] = intermediates
@@ -291,6 +330,80 @@ class ConsistencyFlowMatchingSampler:
         v_pred = self._denoise(x_init, denoiser, sigma, cond, st, uc)
         sigma_bc = append_dims(sigma, x_init.ndim)
         x_clean = x_init + sigma_bc * v_pred
+        x_clean = self._finalize(x_clean, mu)
+
+        others = {}
+        if return_intermediate:
+            others["intermediates"] = [tools_scale(x_init.clone().detach())]
+        if return_denoised:
+            others["denoiseds"] = [tools_scale(x_clean.clone().detach())]
+
+        return x_clean, others
+
+
+class MeanFlowSampler(ConsistencyFlowMatchingSampler):
+    """Sampler for MeanFlow average-velocity models.
+
+    The network predicts the average velocity u(x_s, s, T) over the jump
+    [s, T] (CFM time, s = 1 - sigma), conditioned on the jump target through
+    `timesteps_r`. Sampling is exact per segment by construction:
+
+        x_T = x_s + (T - s) * u(x_s, s, T)
+
+    1-step inference jumps the full path:  x_pred = mu + u(mu, 0, 1).
+    Multi-step splits [0, 1] into segments along the sigma schedule.
+
+    Stochastic churn is not supported (average velocities are only defined on
+    the deterministic OT path); s_churn is forced to 0.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.s_churn = 0.0
+
+    def _denoise_jump(self, x, denoiser, sigma, sigma_next, cond, st, uc):
+        from .loss_meanflow import meanflow_c_noise
+
+        T = self.sigma2st(sigma_next)
+        u_pred = denoiser(
+            *self.guider.prepare_inputs(x, sigma, cond, uc),
+            st=st,
+            timesteps_r=meanflow_c_noise(T),
+        )
+        return self.guider(u_pred, sigma)
+
+    def _sampler_step(self, sigma, next_sigma, denoiser, x, mu, cond, uc):
+        st = self.sigma2st(sigma)           # current time s
+        st_next = self.sigma2st(next_sigma)  # jump target T
+        u_pred = self._denoise_jump(x, denoiser, sigma, next_sigma, cond, st, uc)
+        gap = append_dims(st_next - st, x.ndim)
+        x_next = x + gap * u_pred
+        # Endpoint estimate for logging: extrapolate the same average
+        # velocity to the clean end (exact when the jump target is T = 1).
+        endpoint = x + append_dims(1.0 - st, x.ndim) * u_pred
+        return x_next, endpoint
+
+    def _one_step(
+        self,
+        denoiser,
+        x,
+        mu,
+        cond,
+        uc=None,
+        return_intermediate: bool = False,
+        return_denoised: bool = False,
+    ):
+        uc = default(uc, cond)
+        s_in = mu.new_ones([mu.shape[0]])
+        sigma = s_in * float(getattr(self.discretization, "sigma_max", 1.0))
+        sigma_zero = torch.zeros_like(sigma)  # jump target T = 1 exactly
+        x_init = mu.clone()
+        st = self.sigma2st(sigma)
+
+        u_pred = self._denoise_jump(x_init, denoiser, sigma, sigma_zero, cond, st, uc)
+        gap = append_dims(self.sigma2st(sigma_zero) - st, x_init.ndim)
+        x_clean = x_init + gap * u_pred
+        x_clean = self._finalize(x_clean, mu)
 
         others = {}
         if return_intermediate:
