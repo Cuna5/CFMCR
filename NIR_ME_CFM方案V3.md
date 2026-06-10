@@ -229,7 +229,7 @@ Aux branch:
 
 ### 3.3 NCB 公式
 
-当前网络中每个 attention / FFN block 通过 `AdaRMSNorm(x, cond)` 接收条件。V3 令：
+当前网络中每个 attention / FFN block 通过 `AdaRMSNorm(x, cond)` 接收条件。令：
 
 ```text
 cond_t = Mapping(t)
