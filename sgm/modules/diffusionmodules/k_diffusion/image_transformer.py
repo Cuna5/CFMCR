@@ -213,7 +213,12 @@ class ApplyRotaryEmbeddingInplace(torch.autograd.Function):
 
 
 def apply_rotary_emb_(x, theta):
-    return ApplyRotaryEmbeddingInplace.apply(x, theta, False)
+    # The custom in-place autograd.Function above only implements reverse
+    # mode. MeanFlow uses torch.func.jvp (forward-mode AD), which therefore
+    # fails before reaching the attention kernel. Use the equivalent
+    # functional implementation so PyTorch can derive both JVP and backward
+    # rules from native tensor operations.
+    return apply_rotary_emb(x, theta, conj=False)
 
 
 class AxialRoPE(nn.Module):

@@ -209,6 +209,11 @@ data:
         aux_mode: "ndvi_only"
 
 lightning:
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params:
+      find_unused_parameters: true
+
   modelcheckpoint:
     params:
       every_n_train_steps: 1000

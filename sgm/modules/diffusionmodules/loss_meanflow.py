@@ -15,7 +15,7 @@ Instead of the instantaneous velocity v_theta of CFM, the network models the
 *average* velocity over a jump [s, T] (s <= T), evaluated at the current
 state x_s:
 
-    u(x_s, s, T) = 1/(T - s) * \int_s^T v(x_tau, tau) dtau
+    u(x_s, s, T) = 1/(T - s) * \\int_s^T v(x_tau, tau) dtau
 
 so that the displacement is exact by construction:
 
@@ -184,6 +184,22 @@ class MeanFlowLoss(ConsistencyFlowMatchingLoss):
         # ── 2. Average-velocity field as a function of (x, s, T) ───────────
         # sigma = 1 - s feeds the denoiser exactly like CFM; the jump target
         # enters through the smooth log-time embedding `timesteps_r`.
+        diffusion_model = getattr(network, "diffusion_model", network)
+        mask_head_enabled = bool(
+            getattr(diffusion_model, "predict_cloud_mask", False)
+        )
+        if mask_head_enabled and self.cloud_mask_pred_loss_weight <= 0.0:
+            raise ValueError(
+                "predict_cloud_mask=true requires "
+                "cloud_mask_pred_loss_weight > 0; otherwise the mask head "
+                "is unused under DDP."
+            )
+        if self.cloud_mask_pred_loss_weight > 0.0 and not mask_head_enabled:
+            raise ValueError(
+                "cloud_mask_pred_loss_weight > 0 requires "
+                "network_config.params.predict_cloud_mask=true."
+            )
+
         def u_fn(x_in, s_in, T_in):
             sigma_in = 1.0 - s_in
             return denoiser(
@@ -204,8 +220,13 @@ class MeanFlowLoss(ConsistencyFlowMatchingLoss):
                 (x_s, s, T),
                 (v, torch.ones_like(s), torch.zeros_like(T)),
             )
+            mask_logits = getattr(diffusion_model, "last_mask_logits", None)
         else:
             u = u_fn(x_s, s, T)
+            # Preserve logits from the grad-enabled primary forward. The
+            # finite-difference probe below runs under no_grad and overwrites
+            # diffusion_model.last_mask_logits.
+            mask_logits = getattr(diffusion_model, "last_mask_logits", None)
             eps = self.fd_eps
             with torch.no_grad():
                 u_shift = u_fn(x_s + eps * v, s + eps, T)
@@ -245,20 +266,25 @@ class MeanFlowLoss(ConsistencyFlowMatchingLoss):
         # Logits come from the u_fn forward; under torch.func.jvp they may be
         # dual tensors, so unpack to the primal before BCE.
         if self.cloud_mask_pred_loss_weight > 0.0:
-            mask_logits = getattr(
-                getattr(network, "diffusion_model", network),
-                "last_mask_logits",
-                None,
-            )
             cloud_mask = self._get_cloud_mask(batch, input)
-            if mask_logits is not None and cloud_mask is not None:
-                unpacked = fwAD.unpack_dual(mask_logits)
-                mask_logits = unpacked.primal if unpacked.primal is not None else mask_logits
-                mask_pred_loss = F.binary_cross_entropy_with_logits(
-                    mask_logits.float(), cloud_mask.float(), reduction="none"
-                ).reshape(B, -1).mean(dim=1).to(dtype=input.dtype)
-            else:
-                mask_pred_loss = f.new_zeros(B)
+            if mask_logits is None:
+                raise RuntimeError(
+                    "Cloud-mask head is enabled but produced no logits."
+                )
+            if cloud_mask is None:
+                raise KeyError(
+                    f"cloud_mask_pred_loss_weight > 0 requires batch key "
+                    f"{self.cloud_mask_key!r}."
+                )
+            unpacked = fwAD.unpack_dual(mask_logits)
+            mask_logits = (
+                unpacked.primal
+                if unpacked.primal is not None
+                else mask_logits
+            )
+            mask_pred_loss = F.binary_cross_entropy_with_logits(
+                mask_logits.float(), cloud_mask.float(), reduction="none"
+            ).reshape(B, -1).mean(dim=1).to(dtype=input.dtype)
         else:
             mask_pred_loss = f.new_zeros(B)
 

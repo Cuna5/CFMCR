@@ -23,6 +23,7 @@ import torch
 from sgm.modules.diffusionmodules.denoiser import ResidualDenoiser
 from sgm.modules.diffusionmodules.k_diffusion.image_transformer import (
     ImageTransformerDenoiserModelInterface,
+    apply_rotary_emb_,
 )
 from sgm.modules.diffusionmodules.loss_meanflow import MeanFlowLoss, meanflow_c_noise
 from sgm.modules.diffusionmodules.sampling_cfm import MeanFlowSampler
@@ -83,6 +84,23 @@ def make_u_fn(wrapper, denoiser, cond):
         )
 
     return u_fn
+
+
+def test_rotary_embedding_jvp():
+    x = torch.randn(2, 3, 4, 8)
+    tangent = torch.randn_like(x)
+    theta = torch.randn(2, 3, 4, 4)
+
+    output, output_tangent = torch.func.jvp(
+        lambda value: apply_rotary_emb_(value, theta),
+        (x,),
+        (tangent,),
+    )
+    expected_tangent = apply_rotary_emb_(tangent, theta)
+
+    assert output.shape == x.shape
+    assert torch.allclose(output_tangent, expected_tangent, atol=1e-6)
+    print("[OK] rotary embedding supports torch.func.jvp")
 
 
 def test_jvp_support(self_attns, label):
@@ -215,6 +233,8 @@ def test_sampler():
 
 
 if __name__ == "__main__":
+    test_rotary_embedding_jvp()
+
     sw_global = [
         {"type": "shifted-window", "d_head": 16, "window_size": 8},
         {"type": "global", "d_head": 16},

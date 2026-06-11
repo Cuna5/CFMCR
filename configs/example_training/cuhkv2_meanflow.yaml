@@ -100,10 +100,11 @@ model:
         full_pair_prob: 0.35
         t1_pair_prob: 0.25
         equal_pair_prob: 0.15
-        jvp_mode: "jvp"
+        # NATTEN 0.17.x does not reliably support forward-mode AD.
+        jvp_mode: "fd"
         fd_eps: 1.0e-2
         clean_endpoint_loss_weight: 1.0
-        ssim_endpoint_loss_weight: 0.0   # scan 0.02/0.05/0.1
+        ssim_endpoint_loss_weight: 0.65   # scan 0.02/0.05/0.1
         non_cloud_identity_loss_weight: 0.2
         cloud_mask_pred_loss_weight: 0.1
         cloud_mask_key: "M"
@@ -167,7 +168,7 @@ data:
         hflip_p: 0.5
         vflip_p: 0.5
         rot90_p: 0.5
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
         mask_gain: 4.0
 
     validation:
@@ -176,7 +177,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
         mask_gain: 4.0
 
     test:
@@ -185,7 +186,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
         mask_gain: 4.0
 
     predict:
@@ -194,10 +195,17 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
         mask_gain: 4.0
 
 lightning:
+  # MeanFlow uses torch.func.jvp and an auxiliary mask-head loss exposed
+  # outside the velocity return value. DDP must traverse the full loss graph.
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params:
+      find_unused_parameters: true
+
   modelcheckpoint:
     params:
       every_n_train_steps: 10000
@@ -227,9 +235,9 @@ lightning:
           return_cond: True
 
   trainer:
-    devices: 0,1
+    devices: 2,3
     num_sanity_val_steps: 0
     benchmark: True
     accumulate_grad_batches: 1
     check_val_every_n_epoch: 5
-    max_epochs: 100
+    max_epochs: 500
