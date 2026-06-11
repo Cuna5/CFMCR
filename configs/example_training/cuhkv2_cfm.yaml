@@ -63,7 +63,7 @@ model:
         # Cloud-probability head (zero-init, checkpoint warm-start safe).
         # Enable together with loss cloud_mask_pred_loss_weight > 0 and
         # sampler mask_composite (B1 ablation).
-        predict_cloud_mask: false
+        predict_cloud_mask: true
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner
@@ -92,9 +92,9 @@ model:
         consistency_loss_weight: 0.5 # teacher velocity consistency
         velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
         clean_endpoint_loss_weight: 1.0  # direct fθ -> x_clean metric anchor
-        ssim_endpoint_loss_weight: 0.75   # MS-SSIM on fθ vs x_clean; scan 0.02/0.05/0.1/0.2
+        ssim_endpoint_loss_weight: 0.65   # MS-SSIM on fθ vs x_clean; scan 0.02/0.05/0.1/0.2
         non_cloud_identity_loss_weight: 0.2  # penalise changes to clear pixels; scan 0.1/0.2/0.3
-        cloud_mask_pred_loss_weight: 0.0     # BCE for the cloud-prob head; must be >0 when predict_cloud_mask=true
+        cloud_mask_pred_loss_weight: 0.1     # BCE for the cloud-prob head; must be >0 when predict_cloud_mask=true
         cloud_mask_key: "M"              # CUHK dataloader cloud mask
         cloud_loss_weight: 2.0           # cloud pixels are weighted 2x, then normalized per sample
         cloud_weight_velocity_anchor: True
@@ -166,7 +166,7 @@ data:
         hflip_p: 0.5
         vflip_p: 0.5
         rot90_p: 0.5
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
 
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -174,7 +174,7 @@ data:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
 
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -184,7 +184,7 @@ data:
         isTrain: False
         # must match the train aux_mode, otherwise train/test aux conditions
         # are distribution-mismatched
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
 
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
@@ -193,8 +193,13 @@ data:
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
         isTrain: False
         # must match the train aux_mode
-        aux_mode: "ndvi_only"
+        aux_mode: "full"
 lightning:
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params:
+      find_unused_parameters: true
+
   modelcheckpoint:
     params:
       every_n_train_steps: 10000
@@ -229,4 +234,4 @@ lightning:
     benchmark: True
     accumulate_grad_batches: 1
     check_val_every_n_epoch: 5
-    max_epochs: 100
+    max_epochs: 500

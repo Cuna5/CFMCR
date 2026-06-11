@@ -124,9 +124,9 @@ model:
         full_pair_prob: 0.35
         t1_pair_prob: 0.25
         equal_pair_prob: 0.15
-        # "jvp" = exact torch.func.jvp; "fd" = finite-difference fallback
-        # (use if natten/flash-attn reject forward-mode AD).
-        jvp_mode: "jvp"
+        # NATTEN 0.17.x does not reliably support forward-mode AD. The FD
+        # path preserves logits from the primary grad-enabled forward.
+        jvp_mode: "fd"
         fd_eps: 1.0e-2
         # Endpoint supervision (applied on T=1 elements only)
         clean_endpoint_loss_weight: 1.0
@@ -231,6 +231,13 @@ data:
         mask_gain: 4.0
 
 lightning:
+  # MeanFlow uses torch.func.jvp and an auxiliary mask-head loss exposed
+  # outside the velocity return value. DDP must traverse the full loss graph.
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params:
+      find_unused_parameters: true
+
   modelcheckpoint:
     params:
       every_n_train_steps: 1000

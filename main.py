@@ -260,13 +260,15 @@ class SetupCallback(Callback):
         self.ckpt_name = ckpt_name
 
     def on_exception(self, trainer: pl.Trainer, pl_module, exception):
-        if not self.debug and trainer.global_rank == 0:
-            print("Summoning checkpoint.")
-            if self.ckpt_name is None:
-                ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
-            else:
-                ckpt_path = os.path.join(self.ckptdir, self.ckpt_name)
-            trainer.save_checkpoint(ckpt_path)
+        # Do not save here. Under DDP, save_checkpoint may enter distributed
+        # collectives after another rank has already failed, which deadlocks
+        # rank 0 and hides the original exception. The regular
+        # ModelCheckpoint callbacks remain responsible for recoverable saves.
+        if trainer.global_rank == 0:
+            print(
+                "Training failed; skipping emergency checkpoint so the "
+                "original exception can terminate cleanly."
+            )
 
     def on_predict_start(self, trainer, pl_module):
         self.on_fit_start(trainer, pl_module)
@@ -764,18 +766,32 @@ if __name__ == "__main__":
 
         # https://pytorch-lightning.readthedocs.io/en/stable/extensions/strategy.html
         # default to ddp if not further specified
-        default_strategy_config = {"target": "pytorch_lightning.strategies.DDPStrategy"}
+        loss_target = OmegaConf.select(
+            config, "model.params.loss_fn_config.target", default=""
+        )
+        cfm_ddp = loss_target in (
+            "sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss",
+            "sgm.modules.diffusionmodules.loss_meanflow.MeanFlowLoss",
+        )
+        default_strategy_config = {
+            "target": "pytorch_lightning.strategies.DDPStrategy",
+            "params": {
+                # CFM uses separate frozen-teacher and student forwards, and
+                # may include optional auxiliary branches. MeanFlow also uses
+                # JVP/FD derivative targets. Let DDP traverse the actual loss
+                # graph for both variants.
+                "find_unused_parameters": cfm_ddp,
+            },
+        }
 
         if "strategy" in lightning_config:
             strategy_cfg = lightning_config.strategy
         else:
             strategy_cfg = OmegaConf.create()
-            default_strategy_config["params"] = {
-                "find_unused_parameters": False,
-                # "static_graph": True,
-                # "ddp_comm_hook": default.fp16_compress_hook  # TODO: experiment with this, also for DDPSharded
-            }
         strategy_cfg = OmegaConf.merge(default_strategy_config, strategy_cfg)
+        if cfm_ddp:
+            strategy_cfg.params.find_unused_parameters = True
+            print("CFM loss detected: enabling DDP unused-parameter detection.")
         print(
             f"strategy config: \n ++++++++++++++ \n {strategy_cfg} \n ++++++++++++++ "
         )
@@ -907,14 +923,24 @@ if __name__ == "__main__":
 
         # allow checkpointing via USR1
         def melk(*args, **kwargs):
-            # run all checkpoint hooks
-            if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
-                if melk_ckpt_name is None:
-                    ckpt_path = os.path.join(ckptdir, "last.ckpt")
-                else:
-                    ckpt_path = os.path.join(ckptdir, melk_ckpt_name)
-                trainer.save_checkpoint(ckpt_path)
+            # A Unix signal normally reaches only one process. Distributed
+            # checkpointing must be entered by all ranks, so saving directly
+            # from this handler can deadlock under DDP.
+            if trainer.world_size > 1:
+                if trainer.global_rank == 0:
+                    print(
+                        "Skipping SIGUSR1 checkpoint under DDP; wait for the "
+                        "regular ModelCheckpoint callback."
+                    )
+                return
+            if trainer.global_rank != 0:
+                return
+            print("Summoning checkpoint.")
+            if melk_ckpt_name is None:
+                ckpt_path = os.path.join(ckptdir, "last.ckpt")
+            else:
+                ckpt_path = os.path.join(ckptdir, melk_ckpt_name)
+            trainer.save_checkpoint(ckpt_path)
 
         def divein(*args, **kwargs):
             if trainer.global_rank == 0:
@@ -932,8 +958,9 @@ if __name__ == "__main__":
             try:
                 trainer.fit(model, data, ckpt_path=ckpt_resume_path)
             except Exception:
-                if not opt.debug:
-                    melk()
+                # SetupCallback already reports that emergency checkpointing
+                # is skipped. Saving again here used to trigger a second
+                # distributed checkpoint attempt and could hang indefinitely.
                 raise
         if not opt.no_test and not trainer.interrupted:
             trainer.test(model, data)

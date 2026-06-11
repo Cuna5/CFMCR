@@ -65,6 +65,7 @@ class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
         self.teacher_model.eval()
         for p in self.teacher_model.parameters():
             p.requires_grad_(False)
+        self._checked_training_gradients = False
 
     # ------------------------------------------------------------------
     # Teacher maintenance
@@ -83,6 +84,33 @@ class ConsistencyFlowMatchingEngine(ResidualDiffusionEngine):
         # Include the CFM teacher update in train_time when timing is enabled.
         self._update_teacher()
         super().on_train_batch_end(*args, **kwargs)
+
+    def on_after_backward(self):
+        """Report parameters skipped by the current backward graph once."""
+        super().on_after_backward()
+        if self._checked_training_gradients:
+            return
+
+        unused = [
+            name
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and param.grad is None
+        ]
+        if unused:
+            preview = "\n  - ".join(unused[:50])
+            suffix = (
+                f"\n  ... and {len(unused) - 50} more"
+                if len(unused) > 50
+                else ""
+            )
+            if getattr(self, "global_rank", 0) == 0:
+                print(
+                    "[MeanFlow/DDP] Parameters without gradients in the "
+                    "first backward pass:\n  - "
+                    f"{preview}{suffix}"
+                )
+
+        self._checked_training_gradients = True
 
     # ------------------------------------------------------------------
     # Teacher callable
