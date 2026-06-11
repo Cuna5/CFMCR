@@ -218,6 +218,41 @@ data:
         nir_datasets_dir: "/your/path/to/nir/CUHK-CR1"
 ```
 
+## RICE1 / RICE2
+
+RICE 数据集使用 RGB 三通道，因此对应配置的网络输入/输出为
+`in_channels=6`、`out_channels=3`。当前本地数据按固定 seed 划分：
+
+| 数据集 | 总数 | Train | Validation | Test |
+|--------|------|-------|------------|------|
+| RICE1 | 500 | 400 | 50 | 50 |
+| RICE2 | 736 | 588 | 74 | 74 |
+
+训练 CFM：
+
+```bash
+python main.py --enable_tf32 true --base configs/example_training/rice1_cfm.yaml
+python main.py --enable_tf32 true --base configs/example_training/rice2_cfm.yaml
+```
+
+训练 MeanFlow：
+
+```bash
+python main.py --enable_tf32 true --base configs/example_training/rice1_meanflow.yaml
+python main.py --enable_tf32 true --base configs/example_training/rice2_meanflow.yaml
+```
+
+默认服务器路径为：
+
+```text
+/data1/home/ely/Projects/CFMCR/dataset/RICE1
+/data1/home/ely/Projects/CFMCR/dataset/RICE2
+```
+
+RICE2 使用 `mask/` 中任意非黑像素作为云影响区域；RICE1 没有原生 mask，
+使用 cloudy/label 的绝对差生成软 mask。两者都只将 mask 用于损失加权和分区
+指标，不作为网络输入。
+
 ## 耗时统计
 
 如需比较速度，打开：

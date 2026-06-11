@@ -1,0 +1,156 @@
+model:
+  base_learning_rate: 1.0e-4
+  target: sgm.models.diffusion_cfm.ConsistencyFlowMatchingEngine
+  params:
+    input_key: "label"
+    mean_key: "cond_image"
+    log_keys: ["cond_image"]
+    compile_model: false
+    use_flash_attn2: false
+    image_metrics: "evaluator"
+    teacher_ema_decay: 0.9999
+    count_sample_time: true
+    count_train_time: true
+    sigma_st_config:
+      target: sgm.modules.diffusionmodules.sigma2st_cfm.ConsistencyFlowMatchingSigma2St
+    denoiser_config:
+      target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
+      params:
+        scaling_config:
+          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.MeanFlowScaling
+    network_wrapper: sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper
+    network_config:
+      target: sgm.modules.diffusionmodules.k_diffusion.image_transformer.ImageTransformerDenoiserModelInterface
+      params:
+        in_channels: 6
+        out_channels: 3
+        patch_size: [1, 1]
+        widths: [128, 256, 384, 768]
+        depths: [2, 2, 2, 2]
+        d_ffs: [256, 512, 768, 1536]
+        self_attns:
+          - {type: "neighborhood", d_head: 64, kernel_size: 7}
+          - {type: "neighborhood", d_head: 64, kernel_size: 7}
+          - {type: "global", d_head: 64}
+          - {type: "global", d_head: 64}
+        dropout_rate: [0.0, 0.0, 0.0, 0.1]
+        mapping_depth: 2
+        mapping_width: 768
+        mapping_d_ff: 1536
+        mapping_dropout_rate: 0.1
+        use_aux_cond: true
+        aux_channels: 5
+        aux_hidden_channels: 64
+        aux_global_mode: "tmm"
+        aux_tmm_gate_hidden_channels: 32
+        use_dual_time: true
+        predict_cloud_mask: false
+    conditioner_config:
+      target: sgm.modules.GeneralConditioner
+      params:
+        emb_models:
+          - {is_trainable: true, input_key: "cond_image", ucg_rate: 0.0, target: sgm.modules.encoders.modules.IndentityEmbedder}
+          - is_trainable: false
+            input_key: "aux_cond"
+            ucg_rate: 0.0
+            target: sgm.modules.encoders.modules.DictEmbedder
+            params: {output_key: "aux_cond"}
+    first_stage_config:
+      target: sgm.models.autoencoder.IdentityFirstStage
+    loss_fn_config:
+      target: sgm.modules.diffusionmodules.loss_meanflow.MeanFlowLoss
+      params:
+        loss_type: "charbonnier"
+        charbonnier_eps: 1.0e-3
+        meanflow_loss_weight: 1.0
+        full_pair_prob: 0.35
+        t1_pair_prob: 0.25
+        equal_pair_prob: 0.15
+        jvp_mode: "fd"
+        fd_eps: 1.0e-2
+        clean_endpoint_loss_weight: 1.0
+        ssim_endpoint_loss_weight: 0.2
+        non_cloud_identity_loss_weight: 0.2
+        cloud_mask_pred_loss_weight: 0.0
+        cloud_mask_key: "M"
+        cloud_loss_weight: 2.0
+        cloud_weight_velocity_anchor: true
+        feather_mask_kernel: 7
+        endpoint_loss_weight: 0.0
+        consistency_loss_weight: 0.0
+        velocity_anchor_loss_weight: 0.0
+        start_pair_prob: 0.0
+        consistency_warmup_steps: 0
+        num_steps: 40
+        discretization_config:
+          target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
+          params: {sigma_min: 0.001, sigma_max: 1.0, rho: 1}
+    sampler_config:
+      target: sgm.modules.diffusionmodules.sampling_cfm.MeanFlowSampler
+      params:
+        num_steps: 1
+        tta: false
+        clamp_output: true
+        mask_composite: false
+        discretization_config:
+          target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
+          params: {sigma_min: 0.001, sigma_max: 1.0, rho: 1}
+    scheduler_config:
+      target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
+      params: {warm_up_steps: 1000, lr_start: 0.01, lr_max: 1.0, lr_min: 0.01, max_decay_steps: 100000}
+    to_rgb_config:
+      target: sgm.util.identity_to_rgb
+
+data:
+  target: sgm.data.base.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 4
+    wrap: true
+    train:
+      target: sgm.data.rice.image_datasets.RICEDataset
+      params:
+        datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/RICE1"
+        split: "train"
+        split_ratios: [0.8, 0.1, 0.1]
+        split_seed: 3407
+        image_size: 256
+        augment: true
+        aux_mode: "full"
+        mask_mode: "difference"
+        mask_gain: 4.0
+    validation:
+      target: sgm.data.rice.image_datasets.RICEDataset
+      params: {datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/RICE1", split: "validation", image_size: 256, aux_mode: "full", mask_mode: "difference", mask_gain: 4.0, augment: false}
+    test:
+      target: sgm.data.rice.image_datasets.RICEDataset
+      params: {datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/RICE1", split: "test", image_size: 256, aux_mode: "full", mask_mode: "difference", mask_gain: 4.0, augment: false}
+    predict:
+      target: sgm.data.rice.image_datasets.RICEDataset
+      params: {datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/RICE1", split: "predict", image_size: 256, aux_mode: "full", mask_mode: "difference", mask_gain: 4.0, augment: false}
+
+lightning:
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params: {find_unused_parameters: true}
+  modelcheckpoint:
+    params: {every_n_train_steps: 1000, monitor: "RMSE"}
+  callbacks:
+    metrics_over_trainsteps_checkpoint:
+      params: {every_n_train_steps: 5000}
+    image_logger:
+      target: main.ImageLogger
+      params:
+        disabled: false
+        batch_frequency: 500
+        max_images: 16
+        increase_log_steps: false
+        log_first_step: false
+        log_images_kwargs: {use_ema_scope: false, N: 16, n_rows: 4, return_intermediate: false, return_denoised: false, return_cond: true}
+  trainer:
+    devices: "0,"
+    num_sanity_val_steps: 0
+    benchmark: true
+    accumulate_grad_batches: 1
+    check_val_every_n_epoch: 5
+    max_epochs: 500
