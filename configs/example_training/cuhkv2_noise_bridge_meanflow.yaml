@@ -1,29 +1,28 @@
 ##############################################################################
-# EMRDM — Consistency Flow Matching (CUHK-CR2 dataset)
+# P1 Noise-Bridge MeanFlow — CUHK-CR2
 #
-# Same CFM approach as cuhk_cfm.yaml, adapted for the CUHK-CR2 dataset:
-#   - batch_size: 1
-#   - check_val_every_n_epoch: 5
-#   - max_epochs: 2000
-#   - loss uses endpoint consistency + velocity consistency + clean endpoint anchor
+# CUHKV2 keeps the original CUHK-CR2 4-channel RGB+NIR setup, aux_mode "full",
+# and aux_global_mode "nce"; only the path changes to the noisy-cloudy bridge.
 ##############################################################################
 
 model:
   base_learning_rate: 1.0e-4
-  target: sgm.models.diffusion_cfm.ConsistencyFlowMatchingEngine
+  target: sgm.models.diffusion.ResidualDiffusionEngine
   params:
     input_key: "label"
-    mean_key:  "cond_image"
+    mean_key: "cond_image"
     log_keys: ["cond_image"]
-    compile_model: False
-    use_flash_attn2: False
+    compile_model: false
+    use_flash_attn2: false
     image_metrics: "evaluator"
-    teacher_ema_decay: 0.9999
-    count_sample_time: True
-    count_train_time: True
+    use_ema: true
+    ema_decay_rate: 0.9999
+    count_sample_time: true
+    count_train_time: true
 
-    # Optional: warm-start from a CFM checkpoint.
-    # ckpt_path: "/path/to/cuhkv2_cfm_pretrained.ckpt"
+    # P1 trains the fixed bridge directly. For P2 warm-starting, set
+    # base_learning_rate to 2.0e-5 and enable noise_ramp_steps.
+    # ckpt_path: "/path/to/cuhkv2_meanflow.ckpt"
 
     sigma_st_config:
       target: sgm.modules.diffusionmodules.sigma2st_cfm.ConsistencyFlowMatchingSigma2St
@@ -32,14 +31,14 @@ model:
       target: sgm.modules.diffusionmodules.denoiser.ResidualDenoiser
       params:
         scaling_config:
-          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.ConsistencyFlowMatchingScaling
+          target: sgm.modules.diffusionmodules.denoiser_scaling_cfm.MeanFlowScaling
 
-    network_wrapper: "sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper"
+    network_wrapper: sgm.modules.diffusionmodules.wrappers.CloudRemovalWrapper
 
     network_config:
       target: sgm.modules.diffusionmodules.k_diffusion.image_transformer.ImageTransformerDenoiserModelInterface
       params:
-        in_channels:  8
+        in_channels: 8
         out_channels: 4
         patch_size: [1, 1]
         widths: [128, 256, 384, 768]
@@ -48,8 +47,8 @@ model:
         self_attns:
           - {type: "neighborhood", d_head: 64, kernel_size: 7}
           - {type: "neighborhood", d_head: 64, kernel_size: 7}
-          - {type: "global",       d_head: 64}
-          - {type: "global",       d_head: 64}
+          - {type: "global", d_head: 64}
+          - {type: "global", d_head: 64}
         dropout_rate: [0.0, 0.0, 0.0, 0.1]
         mapping_depth: 2
         mapping_width: 768
@@ -58,22 +57,20 @@ model:
         use_aux_cond: true
         aux_channels: 5
         aux_hidden_channels: 64
-        aux_global_mode: "tmm"
+        aux_global_mode: "nce"
         aux_tmm_gate_hidden_channels: 32
-        # Cloud-probability head (zero-init, checkpoint warm-start safe).
-        # Enable together with loss cloud_mask_pred_loss_weight > 0 and
-        # sampler mask_composite (B1 ablation).
-        predict_cloud_mask: true
+        use_dual_time: true
+        predict_cloud_mask: false
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner
       params:
         emb_models:
-          - is_trainable: True
+          - is_trainable: true
             input_key: "cond_image"
             ucg_rate: 0.0
             target: sgm.modules.encoders.modules.IndentityEmbedder
-          - is_trainable: False
+          - is_trainable: false
             input_key: "aux_cond"
             ucg_rate: 0.0
             target: sgm.modules.encoders.modules.DictEmbedder
@@ -84,51 +81,44 @@ model:
       target: sgm.models.autoencoder.IdentityFirstStage
 
     loss_fn_config:
-      target: sgm.modules.diffusionmodules.loss_cfm.ConsistencyFlowMatchingLoss
+      target: sgm.modules.diffusionmodules.loss_noise_bridge_meanflow.NoiseBridgeMeanFlowLoss
       params:
+        noise_sigma: 0.10
+        noise_ramp_steps: 0
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
-        endpoint_loss_weight: 0.5    # teacher endpoint consistency
-        consistency_loss_weight: 0.5 # teacher velocity consistency
-        velocity_anchor_loss_weight: 1.0 # supervised v* = x_clean - μ
-        clean_endpoint_loss_weight: 1.0  # direct fθ -> x_clean metric anchor
-        ssim_endpoint_loss_weight: 0.65   # MS-SSIM on fθ vs x_clean; scan 0.02/0.05/0.1/0.2
-        non_cloud_identity_loss_weight: 0.2  # penalise changes to clear pixels; scan 0.1/0.2/0.3
-        cloud_mask_pred_loss_weight: 0.1     # BCE for the cloud-prob head; must be >0 when predict_cloud_mask=true
-        cloud_mask_key: "M"              # CUHK dataloader cloud mask
-        cloud_loss_weight: 2.0           # cloud pixels are weighted 2x, then normalized per sample
-        cloud_weight_velocity_anchor: True
-        feather_mask_kernel: 7           # 软化云掩膜核大小（奇数，如 7 或 11），0 表示关闭，用于减少边缘扭曲
-        start_pair_prob: 0.35            # oversample σ≈1 for 1-step quality
-        # Two-stage warmup: disable consistency terms for the first N steps
-        # so the teacher can stabilise while supervised anchors shape velocity.
-        consistency_warmup_steps: 2000
+        meanflow_loss_weight: 1.0
+        clean_endpoint_loss_weight: 1.0
+        full_pair_prob: 0.35
+        t1_pair_prob: 0.25
+        equal_pair_prob: 0.15
+        jvp_mode: "fd"
+        fd_eps: 1.0e-2
+        cloud_loss_weight: 1.0
+        cloud_weight_velocity_anchor: false
+        non_cloud_identity_loss_weight: 0.0
+        ssim_endpoint_loss_weight: 0.0
+        cloud_mask_pred_loss_weight: 0.0
+        endpoint_loss_weight: 0.0
+        consistency_loss_weight: 0.0
+        velocity_anchor_loss_weight: 0.0
+        start_pair_prob: 0.0
+        consistency_warmup_steps: 0
         num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
           params:
             sigma_min: 0.001
-            sigma_max: 1.0   # σ=1 matches t=0; CFM scaling clamps log
+            sigma_max: 1.0
             rho: 1
 
     sampler_config:
-      target: sgm.modules.diffusionmodules.sampling_cfm.ConsistencyFlowMatchingSampler
+      target: sgm.modules.diffusionmodules.sampling_noise_bridge_meanflow.NoiseBridgeMeanFlowSampler
       params:
-        num_steps: 1 # 4/7/10
-        # Test-Time Augmentation: average 4 geometric variants (orig + hflip
-        # + vflip + hvflip).  Typically +0.1~0.3 dB PSNR at 4× inference cost.
-        # Enable via CLI: model.params.sampler_config.params.tta=True
-        tta: False
-        # Stochastic churn for multi-step CFM sampling only (num_steps > 1).
-        # sigma_hat is clamped to sigma_max to avoid leaving the trained range.
-        s_churn: 0.0
-        s_tmin: 0.0
-        s_tmax: 100000000.0
-        s_noise: 1.0
-        # clamp final output to [-1,1] so outlier pixels cannot hurt RMSE/PSNR
-        clamp_output: false
-        # blend prediction with input using the predicted cloud probability:
-        # x_final = (1-m)*mu + m*x_pred (requires predict_cloud_mask=true)
+        noise_sigma: 0.10
+        num_steps: 1
+        tta: false
+        clamp_output: true
         mask_composite: false
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
@@ -140,7 +130,6 @@ model:
     scheduler_config:
       target: sgm.lr_scheduler.LambdaWarmUpCosineScheduler
       params:
-        # Multipliers on top of base_learning_rate.
         warm_up_steps: 2000
         lr_start: 0.01
         lr_max: 1.0
@@ -155,83 +144,79 @@ data:
   params:
     batch_size: 4
     num_workers: 8
-    wrap: True
+    wrap: true
     train:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
-        isTrain: True
-        augment: True
+        isTrain: true
+        augment: true
         hflip_p: 0.5
         vflip_p: 0.5
         rot90_p: 0.5
         aux_mode: "full"
-
+        mask_gain: 4.0
     validation:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
-        isTrain: False
+        isTrain: false
         aux_mode: "full"
-
+        mask_gain: 4.0
     test:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
-        isTrain: False
-        # must match the train aux_mode, otherwise train/test aux conditions
-        # are distribution-mismatched
+        isTrain: false
         aux_mode: "full"
-
+        mask_gain: 4.0
     predict:
       target: sgm.data.cuhk.image_datasets.TrainDataset
       params:
         datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/CUHK-CR2"
         nir_datasets_dir: "/data1/home/ely/Projects/CFMCR/dataset/nir/CUHK-CR2"
-        isTrain: False
-        # must match the train aux_mode
+        isTrain: false
         aux_mode: "full"
+        mask_gain: 4.0
+
 lightning:
   strategy:
     target: pytorch_lightning.strategies.DDPStrategy
     params:
-      find_unused_parameters: true
-
+      find_unused_parameters: false
   modelcheckpoint:
     params:
       every_n_train_steps: 10000
       monitor: "RMSE"
-
   callbacks:
     metrics_over_trainsteps_checkpoint:
       params:
         every_n_train_steps: 5000
-
     image_logger:
       target: main.ImageLogger
       params:
-        disabled: False
+        disabled: false
         batch_frequency: 500
         max_images: 64
-        increase_log_steps: True
-        log_first_step: False
+        increase_log_steps: true
+        log_first_step: false
         log_images_kwargs:
-          use_ema_scope: False
+          use_ema_scope: false
           N: 64
           n_rows: 16
-          return_intermediate: False
-          return_denoised: False
-          return_add_mu: False
-          return_add_noise: False
-          return_cond: True
-
+          return_intermediate: false
+          return_denoised: false
+          return_add_mu: false
+          return_add_noise: false
+          return_cond: true
   trainer:
-    devices: 0,1
+    devices: "2,3"
     num_sanity_val_steps: 0
-    benchmark: True
+    benchmark: true
     accumulate_grad_batches: 1
     check_val_every_n_epoch: 5
+    gradient_clip_val: 1.0
     max_epochs: 500
