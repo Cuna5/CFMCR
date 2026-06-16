@@ -19,4 +19,12 @@
 /.vscode/
 /data/
 /.claude/
+/figures/
+
 .DS_Store
+新思路.md
+改进方案.md
+EX.md
+use.md
+NIR_ME_CFM方案V3.md
+Qwen_SemCond_方案A.md

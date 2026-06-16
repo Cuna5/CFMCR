@@ -24,6 +24,7 @@ import pandas as pd
 import cv2
 from matplotlib import pyplot as plt  
 from mpl_toolkits.axes_grid1 import ImageGrid
+from torchmetrics.image.fid import FrechetInceptionDistance
 class DiffusionEngine(pl.LightningModule):
     def __init__(
         self,
@@ -390,6 +391,9 @@ class ResidualDiffusionEngine(DiffusionEngine):
         self.to_rgb_func = instantiate_from_config(to_rgb_config)
         self.count_sample_time = count_sample_time
         self.count_train_time = count_train_time
+        # FID: feature_layer=2048 (InceptionV3 pool3); reset_real_features=False so
+        # real features are accumulated once per epoch and not wiped by update(fake).
+        self._fid = FrechetInceptionDistance(feature=2048, reset_real_features=False, normalize=True)
         if self.count_train_time:
             self.train_timer = None
             self.train_time = 0.0
@@ -692,6 +696,12 @@ class ResidualDiffusionEngine(DiffusionEngine):
             raw_metrics = {"raw_" + k:v for k, v in raw_metrics.items() if not (isinstance(v, float) and math.isnan(v))}
             self.log_dict(raw_metrics, sync_dist=True, batch_size=1, on_epoch=True)
             self.avg_metrics.add(metrics)
+            # FID: accumulate 3-ch RGB in [0,1]
+            _fid_real = self.to_rgb_func(_target.unsqueeze(0)).clamp(0, 1).float()
+            _fid_fake = self.to_rgb_func(_samples.unsqueeze(0)).clamp(0, 1).float()
+            self._fid.to(self.device)
+            self._fid.update(_fid_real, real=True)
+            self._fid.update(_fid_fake, real=False)
         
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
@@ -735,6 +745,7 @@ class ResidualDiffusionEngine(DiffusionEngine):
     @torch.no_grad()
     def on_predict_epoch_start(self, *args, **kwargs):
         self.all_pred_metrics = []
+        self._fid.reset()
 
     @torch.no_grad()
     def on_predict_epoch_end(self, *args, **kwargs):
@@ -744,8 +755,14 @@ class ResidualDiffusionEngine(DiffusionEngine):
                 if k not in metrics:
                     metrics[k] = []
                 metrics[k].append(v)
-        
+
         pd.DataFrame(metrics).to_csv(self.logger.save_dir + "/metrics.csv")
+
+        try:
+            fid_val = self._fid.compute().item()
+        except Exception:
+            fid_val = float("nan")
+        pd.DataFrame({"FID": [fid_val]}).to_csv(self.logger.save_dir + "/metrics_summary.csv", index=False)
 
     @torch.no_grad()
     def predict_step(self, batch, batch_idx):
@@ -799,10 +816,17 @@ class ResidualDiffusionEngine(DiffusionEngine):
         if sample_time is not None:
             metrics["sample_time"] = sample_time
         self.all_pred_metrics.append(metrics)
-    
+        # FID accumulation
+        _fid_real = self.to_rgb_func(target).clamp(0, 1).float()
+        _fid_fake = self.to_rgb_func(samples).clamp(0, 1).float()
+        self._fid.to(self.device)
+        self._fid.update(_fid_real, real=True)
+        self._fid.update(_fid_fake, real=False)
+
     @torch.no_grad()
     def on_test_epoch_start(self, *args, **kwargs):
         self.avg_metrics.reset()
+        self._fid.reset()
 
     @torch.no_grad()
     def on_test_epoch_end(self, *args, **kwargs):
@@ -810,6 +834,10 @@ class ResidualDiffusionEngine(DiffusionEngine):
         final_metrics = {}
         for k,v in avg_metrics.items():
             final_metrics["final_" + k] = v
+        try:
+            final_metrics["final_FID"] = self._fid.compute().item()
+        except Exception:
+            pass
         self.log_dict(final_metrics, sync_dist=True, on_epoch=True)
         
     @torch.no_grad()

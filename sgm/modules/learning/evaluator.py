@@ -75,6 +75,24 @@ def _region_metrics(target01, pred01, img_target, img_pred, region, suffix):
     return out
 
 
+def _ndvi_metrics(target, pred):
+    """Per-image NDVI error for RGBNIR images (channel order R=0, NIR=3).
+
+    target/pred: float tensor [1, C, H, W] in [0, 1].
+    Returns {} for non-4-channel inputs (e.g. RGB-only RICE).
+    """
+    if target.shape[1] < 4:
+        return {}
+    eps = 1e-4
+    r_t, nir_t = target[0, 0], target[0, 3]
+    r_p, nir_p = pred[0, 0], pred[0, 3]
+    ndvi_t = (nir_t - r_t) / (nir_t + r_t + eps)
+    ndvi_p = (nir_p - r_p) / (nir_p + r_p + eps)
+    ndvi_mae  = float(torch.abs(ndvi_t - ndvi_p).mean().item())
+    ndvi_rmse = float(torch.sqrt(((ndvi_t - ndvi_p) ** 2).mean()).item())
+    return {"NDVI_MAE": ndvi_mae, "NDVI_RMSE": ndvi_rmse}
+
+
 def img_metrics(target, pred, mask=None, mask_threshold=0.1):
     rmse = torch.sqrt(torch.mean((target - pred) ** 2)).item()
     imgA = pred.squeeze(0) * 2 - 1 # 0-1 to -1-1
@@ -121,6 +139,8 @@ def img_metrics(target, pred, mask=None, mask_threshold=0.1):
         metric_dict.update(
             _region_metrics(target01, pred01, imgB, imgA, ~cloudy_region, "cloudfree")
         )
+
+    metric_dict.update(_ndvi_metrics(target, pred))
     return metric_dict
 
 class avg_img_metrics():
@@ -129,6 +149,7 @@ class avg_img_metrics():
             'PSNR', 'SSIM', 'LPIPS', 'RMSE',
             'PSNR_cloudy', 'SSIM_cloudy', 'RMSE_cloudy',
             'PSNR_cloudfree', 'SSIM_cloudfree', 'RMSE_cloudfree',
+            'NDVI_MAE', 'NDVI_RMSE',
         ]
         self.running_img_metrics = {}
         self.running_nonan_count = {}

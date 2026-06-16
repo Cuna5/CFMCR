@@ -429,5 +429,6 @@ sampler_config:
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
 
-## V3.0版本说明
-1. 现已支持RICE数据集
+## V3.1版本说明
+1. 添加评测指标FID/NDVI
+2. 噪声桥添加
