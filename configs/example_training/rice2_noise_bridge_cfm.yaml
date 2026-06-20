@@ -53,7 +53,7 @@ model:
         aux_hidden_channels: 64
         aux_global_mode: "tmm"
         aux_tmm_gate_hidden_channels: 32
-        predict_cloud_mask: false
+        predict_cloud_mask: true
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner
@@ -77,6 +77,8 @@ model:
       target: sgm.modules.diffusionmodules.loss_noise_bridge_cfm.NoiseBridgeConsistencyFlowMatchingLoss
       params:
         noise_sigma: 0.10
+        spatial_noise: true
+        noise_sigma_floor: 0.08
         noise_ramp_steps: 0
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
@@ -86,11 +88,12 @@ model:
         clean_endpoint_loss_weight: 1.0
         start_pair_prob: 0.35
         consistency_warmup_steps: 2000
+        cloud_mask_key: "M"
         cloud_loss_weight: 1.0
         cloud_weight_velocity_anchor: false
         non_cloud_identity_loss_weight: 0.0
         ssim_endpoint_loss_weight: 0.0
-        cloud_mask_pred_loss_weight: 0.0
+        cloud_mask_pred_loss_weight: 0.1
         num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
@@ -103,6 +106,8 @@ model:
       target: sgm.modules.diffusionmodules.sampling_noise_bridge_cfm.NoiseBridgeConsistencyFlowMatchingSampler
       params:
         noise_sigma: 0.10
+        spatial_noise: true
+        noise_sigma_floor: 0.08
         num_steps: 1
         tta: false
         s_churn: 0.0

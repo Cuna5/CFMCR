@@ -3,7 +3,7 @@
 The student and EMA teacher are evaluated on two points from the same random
 straight path:
 
-    y       = x_cloudy + noise_sigma * eps
+    y       = x_cloudy + noise_scale * eps
     x_t     = (1 - t) * y + t * x_clean
     v_true  = x_clean - y
 
@@ -32,6 +32,8 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         *args,
         noise_sigma: float = 0.1,
         noise_ramp_steps: int = 0,
+        spatial_noise: bool = False,
+        noise_sigma_floor: float = 0.08,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -39,8 +41,12 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             raise ValueError("noise_sigma must be non-negative")
         if noise_ramp_steps < 0:
             raise ValueError("noise_ramp_steps must be non-negative")
+        if not 0.0 <= noise_sigma_floor <= 1.0:
+            raise ValueError("noise_sigma_floor must be in [0, 1]")
         self.noise_sigma = float(noise_sigma)
         self.noise_ramp_steps = int(noise_ramp_steps)
+        self.spatial_noise = bool(spatial_noise)
+        self.noise_sigma_floor = float(noise_sigma_floor)
 
     def noise_sigma_at(self, global_step) -> float:
         if self.noise_ramp_steps == 0:
@@ -60,9 +66,9 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         t_current: torch.Tensor,
         t_next: torch.Tensor,
         noise: torch.Tensor,
-        noise_sigma: float,
+        noise_scale,
     ):
-        noisy_start = x_cloudy + noise_sigma * noise
+        noisy_start = x_cloudy + noise_scale * noise
         t_current_bc = append_dims(t_current, x_clean.ndim)
         t_next_bc = append_dims(t_next, x_clean.ndim)
         x_current = (
@@ -75,6 +81,24 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         )
         velocity = x_clean - noisy_start
         return noisy_start, x_current, x_next, velocity
+
+    def _get_noise_scale(
+        self,
+        batch: Dict,
+        input: torch.Tensor,
+        noise_sigma: float,
+    ):
+        if not self.spatial_noise:
+            return noise_sigma
+
+        cloud_mask = self._get_cloud_mask(batch, input)
+        if cloud_mask is None:
+            raise RuntimeError(
+                "spatial_noise=true requires the configured cloud mask "
+                f"batch key {self.cloud_mask_key!r}."
+            )
+        floor = self.noise_sigma_floor
+        return noise_sigma * (floor + (1.0 - floor) * cloud_mask)
 
     def _forward(
         self,
@@ -136,13 +160,14 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
                 f"{tuple(input.shape)}"
             )
 
+        noise_scale = self._get_noise_scale(batch, input, current_noise_sigma)
         _, x_current, x_next, velocity_target = self._build_bridge_points(
             input,
             mu,
             t_current,
             t_next,
             noise,
-            current_noise_sigma,
+            noise_scale,
         )
 
         velocity_teacher = teacher_fn(

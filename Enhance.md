@@ -429,6 +429,95 @@ sampler_config:
 - EMA decay 调度：收益不确定，优先级低于 endpoint loss 和数据采样。
 
 
-## V3.1版本说明
-1. 添加评测指标FID/NDVI
-2. 噪声桥添加
+
+
+## V3.2版本说明
+
+P0 已落地到 noise-bridge CFM。核心变化是把全图统一的噪声桥起点：
+
+```text
+y = x_cloudy + noise_sigma * eps
+```
+
+改为逐像素软噪声尺度：
+
+```text
+gamma(p) = noise_sigma * [noise_sigma_floor + (1 - noise_sigma_floor) * M(p)]
+y = x_cloudy + gamma(p) * eps
+```
+
+其中 `M(p)` 始终是连续软概率，不做硬门控。晴空区只保留 `noise_sigma_floor` 级别的小噪声，云区仍使用完整 `noise_sigma`。
+
+### 训练端
+
+`sgm/modules/diffusionmodules/loss_noise_bridge_cfm.py` 新增：
+
+```yaml
+spatial_noise: true
+noise_sigma_floor: 0.08
+```
+
+训练时 `gamma` 从 batch 中的 `M` 生成。这里使用 `M` 是合法的，因为它只是训练监督信号；推理阶段不会读取 label-derived mask。桥上点和速度仍然由同一条直线路径解析构造，因此端点一致性、速度一致性、速度锚点等 CFM 逻辑不需要改。
+
+### 推理端
+
+`sgm/modules/diffusionmodules/sampling_noise_bridge_cfm.py` 同步新增 `spatial_noise` 和 `noise_sigma_floor`。推理时 sampler 会先用 `mu` 做一次 mask prepass：
+
+```text
+mu -> network -> last_mask_logits -> sigmoid -> M_hat -> gamma_hat
+```
+
+然后从合法起点采样：
+
+```text
+x_init = mu + gamma_hat * randn
+```
+
+因此 P0 推理不依赖验证 / 测试 dataloader 里的 `M`，避免评测泄漏。当前 P0 采样路径只支持 `sampler.num_steps=1`；如果开启 `spatial_noise=true` 又把采样步数改成多步，会显式报错。
+
+### 配置同步
+
+四个 noise-bridge CFM 配置已同步开启 P0：
+
+```text
+configs/example_training/cuhk_noise_bridge_cfm.yaml
+configs/example_training/cuhkv2_noise_bridge_cfm.yaml
+configs/example_training/rice1_noise_bridge_cfm.yaml
+configs/example_training/rice2_noise_bridge_cfm.yaml
+```
+
+关键参数：
+
+```yaml
+network_config:
+  params:
+    predict_cloud_mask: true
+
+loss_fn_config:
+  params:
+    noise_sigma: 0.10
+    spatial_noise: true
+    noise_sigma_floor: 0.08
+    cloud_mask_key: "M"
+    cloud_mask_pred_loss_weight: 0.1
+    non_cloud_identity_loss_weight: 0.0
+
+sampler_config:
+  params:
+    noise_sigma: 0.10
+    spatial_noise: true
+    noise_sigma_floor: 0.08
+    num_steps: 1
+    mask_composite: false
+```
+
+注意：`mask_composite` 必须保持 `false`。P0 使用预测云概率调制输入噪声，不在输出端把 `mu` 硬混回去，避免漏云区域被直接拷回含云输入。
+
+### 测试
+
+`test_noise_bridge_cfm.py` 已补充 P0 smoke tests：
+
+- 标量 noise-bridge 旧路径仍兼容。
+- 训练端 `M -> gamma` 的空间噪声尺度正确。
+- 采样端 `last_mask_logits -> M_hat -> gamma_hat` 的 prepass 正确。
+- `spatial_noise + predict_cloud_mask` 可正常反向传播，mask head 有梯度。
