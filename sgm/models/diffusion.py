@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 from omegaconf import ListConfig, OmegaConf
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
@@ -346,7 +347,24 @@ class DiffusionEngine(pl.LightningModule):
         return log
 
 class ResidualDiffusionEngine(DiffusionEngine):
-    def __init__(self, sigma_st_config, to_rgb_config, scale_01_config=None, ideal_sampler_config = None, mean_key="mu", use_flash_attn2 = False, compile_model = False, image_metrics="metrics", count_train_time=False, count_sample_time=False,*args, **kwargs):
+    def __init__(
+        self,
+        sigma_st_config,
+        to_rgb_config,
+        scale_01_config=None,
+        ideal_sampler_config=None,
+        mean_key="mu",
+        use_flash_attn2=False,
+        compile_model=False,
+        image_metrics="metrics",
+        count_train_time=False,
+        count_sample_time=False,
+        oracle_mask_composite=False,
+        oracle_mask_key="M",
+        oracle_mask_threshold=None,
+        *args,
+        **kwargs,
+    ):
         if compile_model:
             os.environ["USE_COMPILE"] = "1"
         else:
@@ -391,6 +409,9 @@ class ResidualDiffusionEngine(DiffusionEngine):
         self.to_rgb_func = instantiate_from_config(to_rgb_config)
         self.count_sample_time = count_sample_time
         self.count_train_time = count_train_time
+        self.oracle_mask_composite = bool(oracle_mask_composite)
+        self.oracle_mask_key = oracle_mask_key
+        self.oracle_mask_threshold = oracle_mask_threshold
         # FID: feature_layer=2048 (InceptionV3 pool3); reset_real_features=False so
         # real features are accumulated once per epoch and not wiped by update(fake).
         self._fid = FrechetInceptionDistance(feature=2048, reset_real_features=False, normalize=True)
@@ -441,6 +462,54 @@ class ResidualDiffusionEngine(DiffusionEngine):
         # assuming unified data format, dataloader returns a dict.
         # image tensors should be scaled to -1 ... 1 and in bchw format
         return batch[key]
+
+    def _mask_to_sample_shape(self, mask, samples):
+        m = mask.to(device=samples.device, dtype=samples.dtype)
+        if m.ndim == 2:
+            m = m.unsqueeze(0).unsqueeze(0)
+        elif m.ndim == 3:
+            m = m.unsqueeze(1)
+        elif m.ndim != 4:
+            raise ValueError(
+                f"oracle mask must be HW, BHW, or BCHW, got {tuple(m.shape)}"
+            )
+
+        if m.shape[-2:] != samples.shape[-2:]:
+            m = F.interpolate(
+                m,
+                size=samples.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        if self.oracle_mask_threshold is not None:
+            m = (m >= float(self.oracle_mask_threshold)).to(dtype=samples.dtype)
+        else:
+            m = m.clamp(0.0, 1.0)
+
+        if m.shape[1] == 1 and samples.shape[1] != 1:
+            m = m.expand(-1, samples.shape[1], -1, -1)
+        elif m.shape[1] != samples.shape[1]:
+            raise ValueError(
+                f"oracle mask channels {m.shape[1]} do not match samples "
+                f"channels {samples.shape[1]}"
+            )
+        return m
+
+    def _apply_oracle_mask_composite(self, samples, mu, batch):
+        """Blend model output with cloudy input using a dataloader mask.
+
+        This is for quick validation diagnostics only:
+            x_final = M * x_pred + (1 - M) * x_cloudy
+        """
+        if not self.oracle_mask_composite:
+            return samples
+        if not isinstance(batch, dict) or self.oracle_mask_key not in batch:
+            raise ValueError(
+                "oracle_mask_composite=true requires batch key "
+                f"{self.oracle_mask_key!r}."
+            )
+        mask = self._mask_to_sample_shape(batch[self.oracle_mask_key], samples)
+        return mask * samples + (1.0 - mask) * mu
     
     def forward(self, x, mu, batch):
         loss = self.loss_fn(self.model, self.denoiser, self.conditioner, self.sigma2st, x, mu, batch)
@@ -609,6 +678,7 @@ class ResidualDiffusionEngine(DiffusionEngine):
                     c, z_mu, shape=z_mu.shape[1:], uc=uc, batch_size=N, return_intermediate=return_intermediate, return_denoised=return_denoised, **sampling_kwargs
                 )
             samples = self.decode_first_stage(samples)
+            samples = self._apply_oracle_mask_composite(samples, mu[:N], batch)
             log["samples"] = self.to_rgb_func(samples)
             if return_intermediate and 'intermediates' in others:
                 log["intermediate"] = self._get_denoise_row_from_list(others['intermediates'], to_rgb_func=self.to_rgb_func) * 2.0 - 1.0
@@ -664,6 +734,7 @@ class ResidualDiffusionEngine(DiffusionEngine):
                 c, z_mu, shape=z_mu.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
             )
             samples = self.decode_first_stage(samples)
+        samples = self._apply_oracle_mask_composite(samples, mu, batch)
         if self.count_sample_time:
             sample_time = self._elapsed_ms(sample_timer)
             self.log_dict(
@@ -783,6 +854,7 @@ class ResidualDiffusionEngine(DiffusionEngine):
                 c, z_mu, shape=z_mu.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
             )
             samples = self.decode_first_stage(samples)
+        samples = self._apply_oracle_mask_composite(samples, mu, batch)
         sample_time = self._elapsed_ms(sample_timer) if self.count_sample_time else None
 
         path = self.logger.save_dir + "/sample/"

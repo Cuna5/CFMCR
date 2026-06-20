@@ -41,7 +41,7 @@ DISCRETIZATION_CONFIG = {
 }
 
 
-def build_network():
+def build_network(predict_cloud_mask=False):
     model = ImageTransformerDenoiserModelInterface(
         in_channels=2 * CHANNELS,
         out_channels=CHANNELS,
@@ -58,12 +58,18 @@ def build_network():
         mapping_width=32,
         mapping_d_ff=64,
         mapping_dropout_rate=0.0,
-        predict_cloud_mask=False,
+        predict_cloud_mask=predict_cloud_mask,
     )
     return CloudRemovalWrapper(model)
 
 
-def build_loss(noise_sigma=0.1, noise_ramp_steps=0):
+def build_loss(
+    noise_sigma=0.1,
+    noise_ramp_steps=0,
+    spatial_noise=False,
+    noise_sigma_floor=0.08,
+    cloud_mask_pred_loss_weight=0.0,
+):
     return NoiseBridgeConsistencyFlowMatchingLoss(
         discretization_config=DISCRETIZATION_CONFIG,
         num_steps=40,
@@ -76,10 +82,13 @@ def build_loss(noise_sigma=0.1, noise_ramp_steps=0):
         consistency_warmup_steps=0,
         noise_sigma=noise_sigma,
         noise_ramp_steps=noise_ramp_steps,
+        spatial_noise=spatial_noise,
+        noise_sigma_floor=noise_sigma_floor,
+        cloud_mask_key="M",
         cloud_loss_weight=1.0,
         non_cloud_identity_loss_weight=0.0,
         ssim_endpoint_loss_weight=0.0,
-        cloud_mask_pred_loss_weight=0.0,
+        cloud_mask_pred_loss_weight=cloud_mask_pred_loss_weight,
     )
 
 
@@ -97,7 +106,7 @@ def test_shared_noise_bridge_points():
         t_current,
         t_next,
         noise,
-        noise_sigma=0.1,
+        noise_scale=0.1,
     )
     expected_start = cloudy + 0.1 * noise
     assert torch.allclose(start, expected_start)
@@ -121,7 +130,7 @@ def test_zero_noise_degenerates_to_cfm_path():
         t_current,
         t_next,
         noise,
-        noise_sigma=0.0,
+        noise_scale=0.0,
     )
     current_t = t_current[:, None, None, None]
     next_t = t_next[:, None, None, None]
@@ -144,6 +153,28 @@ def test_noise_ramp():
     assert abs(loss_fn.noise_sigma_at(50) - 0.1) < 1e-8
     assert abs(loss_fn.noise_sigma_at(100) - 0.2) < 1e-8
     print("[OK] CFM noise ramp reaches the configured target")
+
+
+def test_spatial_noise_scale_from_mask():
+    loss_fn = build_loss(
+        noise_sigma=0.2,
+        spatial_noise=True,
+        noise_sigma_floor=0.1,
+    )
+    clean = torch.zeros(BATCH, CHANNELS, HEIGHT, WIDTH)
+    mask = torch.zeros(BATCH, 1, HEIGHT, WIDTH)
+    mask[:, :, : HEIGHT // 2] = 1.0
+    scale = loss_fn._get_noise_scale({"M": mask}, clean, noise_sigma=0.2)
+    assert scale.shape == (BATCH, 1, HEIGHT, WIDTH)
+    assert torch.allclose(
+        scale[:, :, : HEIGHT // 2],
+        torch.full_like(scale[:, :, : HEIGHT // 2], 0.2),
+    )
+    assert torch.allclose(
+        scale[:, :, HEIGHT // 2 :],
+        torch.full_like(scale[:, :, HEIGHT // 2 :], 0.02),
+    )
+    print("[OK] spatial training noise scale follows the soft cloud mask")
 
 
 def test_oracle_sampler_and_reproducibility():
@@ -203,6 +234,53 @@ def test_zero_noise_sampler_matches_cfm():
     print("[OK] zero-noise sampler matches deterministic CFM")
 
 
+def test_spatial_sampler_predicts_noise_scale():
+    class FakeDiffusionModel:
+        def __init__(self):
+            self.last_mask_logits = None
+
+    class FakeWrappedNetwork:
+        def __init__(self):
+            self.diffusion_model = FakeDiffusionModel()
+
+    cloudy = torch.zeros(BATCH, CHANNELS, HEIGHT, WIDTH)
+    cond = {"concat": cloudy}
+    logits = torch.full((BATCH, 1, HEIGHT, WIDTH), -80.0)
+    logits[:, :, : HEIGHT // 2] = 80.0
+    network = FakeWrappedNetwork()
+
+    def denoiser(x, sigma, c, st, **extra):
+        del x, sigma, c, st, extra
+        network.diffusion_model.last_mask_logits = logits
+        return torch.zeros_like(cloudy)
+
+    sampler = NoiseBridgeConsistencyFlowMatchingSampler(
+        discretization_config=DISCRETIZATION_CONFIG,
+        num_steps=1,
+        device="cpu",
+        noise_sigma=0.2,
+        spatial_noise=True,
+        noise_sigma_floor=0.1,
+        clamp_output=False,
+        mask_composite=False,
+    )
+    sampler.set_sigma2st(ConsistencyFlowMatchingSigma2St())
+    sampler.set_network_ref(network)
+    sigma = torch.ones(BATCH)
+    st = sampler.sigma2st(sigma)
+    scale = sampler._predict_noise_scale(denoiser, cloudy, sigma, cond, st, cond)
+    assert scale.shape == (BATCH, 1, HEIGHT, WIDTH)
+    assert torch.allclose(
+        scale[:, :, : HEIGHT // 2],
+        torch.full_like(scale[:, :, : HEIGHT // 2], 0.2),
+    )
+    assert torch.allclose(
+        scale[:, :, HEIGHT // 2 :],
+        torch.full_like(scale[:, :, HEIGHT // 2 :], 0.02),
+    )
+    print("[OK] sampler prepass converts predicted mask logits to spatial noise")
+
+
 def test_loss_forward_backward():
     network = build_network()
     denoiser = ResidualDenoiser(scaling_config=SCALING_CONFIG)
@@ -233,11 +311,52 @@ def test_loss_forward_backward():
     print(f"[OK] noise-bridge CFM forward/backward: {loss.item():.4f}")
 
 
+def test_spatial_loss_with_mask_head_backward():
+    network = build_network(predict_cloud_mask=True)
+    denoiser = ResidualDenoiser(scaling_config=SCALING_CONFIG)
+    sigma2st = ConsistencyFlowMatchingSigma2St()
+    loss_fn = build_loss(
+        spatial_noise=True,
+        noise_sigma_floor=0.1,
+        cloud_mask_pred_loss_weight=0.1,
+    )
+    clean = torch.randn(BATCH, CHANNELS, HEIGHT, WIDTH)
+    cloudy = torch.randn_like(clean)
+    cond = {"concat": cloudy}
+    batch = {
+        "global_step": 100,
+        "M": torch.rand(BATCH, 1, HEIGHT, WIDTH),
+    }
+
+    def teacher_fn(x, sigma, st, c, **extra):
+        del sigma, st, c, extra
+        return torch.zeros_like(x)
+
+    loss = loss_fn._forward(
+        network,
+        teacher_fn,
+        denoiser,
+        cond,
+        sigma2st,
+        clean,
+        cloudy,
+        batch,
+    ).mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    grad = network.diffusion_model.mask_out.proj.weight.grad
+    assert grad is not None and grad.abs().sum() > 0
+    print(f"[OK] spatial noise + mask-head backward: {loss.item():.4f}")
+
+
 if __name__ == "__main__":
     test_shared_noise_bridge_points()
     test_zero_noise_degenerates_to_cfm_path()
     test_noise_ramp()
+    test_spatial_noise_scale_from_mask()
     test_oracle_sampler_and_reproducibility()
     test_zero_noise_sampler_matches_cfm()
+    test_spatial_sampler_predicts_noise_scale()
     test_loss_forward_backward()
+    test_spatial_loss_with_mask_head_backward()
     print("all noise-bridge CFM smoke tests passed")

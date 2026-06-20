@@ -1,6 +1,7 @@
 """Sampler for noise-bridge Consistency Flow Matching models."""
 
 import torch
+import torch.nn.functional as F
 
 from ...util import append_dims, default, tools_scale
 from .sampling_cfm import ConsistencyFlowMatchingSampler, _TTA_TRANSFORMS
@@ -11,26 +12,118 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
 ):
     """CFM sampler initialized from cloudy input plus caller-provided noise."""
 
-    def __init__(self, *args, noise_sigma: float = 0.1, **kwargs):
+    def __init__(
+        self,
+        *args,
+        noise_sigma: float = 0.1,
+        spatial_noise: bool = False,
+        noise_sigma_floor: float = 0.08,
+        **kwargs,
+    ):
         if noise_sigma < 0.0:
             raise ValueError("noise_sigma must be non-negative")
+        if not 0.0 <= noise_sigma_floor <= 1.0:
+            raise ValueError("noise_sigma_floor must be in [0, 1]")
         super().__init__(*args, **kwargs)
         self.noise_sigma = float(noise_sigma)
+        self.spatial_noise = bool(spatial_noise)
+        self.noise_sigma_floor = float(noise_sigma_floor)
+        if self.spatial_noise and self.mask_composite:
+            raise ValueError(
+                "spatial_noise uses the predicted cloud probability to "
+                "modulate the input noise; keep mask_composite=false."
+            )
         # Additional churn leaves the path used during training.
         self.s_churn = 0.0
 
-    def _noise_start(self, x_randn, mu):
+    def _noise_start(self, x_randn, mu, noise_scale=None):
         if x_randn.shape != mu.shape:
             raise ValueError(
                 f"noise shape {tuple(x_randn.shape)} does not match cloudy "
                 f"input {tuple(mu.shape)}"
             )
-        return mu + self.noise_sigma * x_randn.to(
+        if noise_scale is None:
+            noise_scale = self.noise_sigma
+        elif torch.is_tensor(noise_scale):
+            noise_scale = noise_scale.to(device=mu.device, dtype=mu.dtype)
+            if noise_scale.ndim != mu.ndim:
+                raise ValueError(
+                    "noise_scale must broadcast as [B,1,H,W] or [B,C,H,W], "
+                    f"got shape {tuple(noise_scale.shape)}"
+                )
+            if noise_scale.shape[0] != mu.shape[0]:
+                raise ValueError(
+                    "noise_scale batch size does not match cloudy input: "
+                    f"{noise_scale.shape[0]} vs {mu.shape[0]}"
+                )
+            if noise_scale.shape[1] not in (1, mu.shape[1]):
+                raise ValueError(
+                    "noise_scale channel dimension must be 1 or match the "
+                    f"cloudy input channels, got {noise_scale.shape[1]}"
+                )
+            if noise_scale.shape[-2:] != mu.shape[-2:]:
+                raise ValueError(
+                    "noise_scale spatial size does not match cloudy input: "
+                    f"{tuple(noise_scale.shape[-2:])} vs {tuple(mu.shape[-2:])}"
+                )
+        return mu + noise_scale * x_randn.to(
             device=mu.device,
             dtype=mu.dtype,
         )
 
+    def _get_last_mask_prob(self, mu):
+        if self._network_ref is None:
+            raise RuntimeError(
+                "spatial_noise=true requires sampler.set_network_ref(model)."
+            )
+        net = getattr(self._network_ref, "diffusion_model", self._network_ref)
+        logits = getattr(net, "last_mask_logits", None)
+        if logits is None:
+            raise RuntimeError(
+                "spatial_noise=true requires network_config.params."
+                "predict_cloud_mask=true so the prepass can produce "
+                "last_mask_logits."
+            )
+        mask = torch.sigmoid(logits.float()).to(device=mu.device, dtype=mu.dtype)
+        if mask.ndim != mu.ndim:
+            raise ValueError(
+                f"Predicted cloud mask has shape {tuple(mask.shape)}, "
+                f"expected BCHW for cloudy input {tuple(mu.shape)}"
+            )
+        if mask.shape[0] == 2 * mu.shape[0]:
+            mask = mask[-mu.shape[0] :]
+        elif mask.shape[0] != mu.shape[0]:
+            raise ValueError(
+                "Predicted cloud mask batch size does not match cloudy input: "
+                f"{mask.shape[0]} vs {mu.shape[0]}"
+            )
+        if mask.shape[1] != 1:
+            mask = mask.max(dim=1, keepdim=True).values
+        if mask.shape[-2:] != mu.shape[-2:]:
+            mask = F.interpolate(
+                mask,
+                size=mu.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return mask.clamp(0.0, 1.0)
+
+    def _noise_scale_from_mask(self, mask):
+        floor = self.noise_sigma_floor
+        return self.noise_sigma * (floor + (1.0 - floor) * mask)
+
+    def _predict_noise_scale(self, denoiser, mu, sigma, cond, st, uc):
+        if not self.spatial_noise:
+            return None
+        _ = self._denoise(mu, denoiser, sigma, cond, st, uc)
+        return self._noise_scale_from_mask(self._get_last_mask_prob(mu))
+
     def _prepare_loop(self, x_randn, mu, cond, uc, num_steps):
+        if self.spatial_noise:
+            raise NotImplementedError(
+                "Noise-bridge spatial_noise currently supports the one-step "
+                "sampler path. Set sampler.num_steps=1."
+            )
         sigmas = self.discretization(
             self.num_steps if num_steps is None else num_steps,
             device=self.device,
@@ -78,8 +171,16 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
         uc = default(uc, cond)
         s_in = mu.new_ones([mu.shape[0]])
         sigma = s_in * sigma_max
-        x_init = self._noise_start(x, mu)
         st = self.sigma2st(sigma)
+        noise_scale = self._predict_noise_scale(
+            denoiser,
+            mu,
+            sigma,
+            cond,
+            st,
+            uc,
+        )
+        x_init = self._noise_start(x, mu, noise_scale)
 
         velocity = self._denoise(x_init, denoiser, sigma, cond, st, uc)
         x_clean = x_init + append_dims(sigma, x_init.ndim) * velocity
