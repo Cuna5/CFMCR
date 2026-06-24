@@ -10,7 +10,12 @@ from .sampling_cfm import ConsistencyFlowMatchingSampler, _TTA_TRANSFORMS
 class NoiseBridgeConsistencyFlowMatchingSampler(
     ConsistencyFlowMatchingSampler
 ):
-    """CFM sampler initialized from cloudy input plus caller-provided noise."""
+    """CFM sampler initialized from cloudy input plus caller-provided noise.
+
+    With ``spatial_noise=True`` the shared one-channel head predicts a soft
+    degradation / gamma probability from the cloudy input, which is mapped to a
+    per-pixel noise scale. The sampler never consumes label-derived masks.
+    """
 
     def __init__(
         self,
@@ -30,7 +35,7 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
         self.noise_sigma_floor = float(noise_sigma_floor)
         if self.spatial_noise and self.mask_composite:
             raise ValueError(
-                "spatial_noise uses the predicted cloud probability to "
+                "spatial_noise uses the predicted gamma probability to "
                 "modulate the input noise; keep mask_composite=false."
             )
         # Additional churn leaves the path used during training.
@@ -81,8 +86,8 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
         if logits is None:
             raise RuntimeError(
                 "spatial_noise=true requires network_config.params."
-                "predict_cloud_mask=true so the prepass can produce "
-                "last_mask_logits."
+                "predict_cloud_mask=true so the shared gamma head can "
+                "produce last_mask_logits."
             )
         mask = torch.sigmoid(logits.float()).to(device=mu.device, dtype=mu.dtype)
         if mask.ndim != mu.ndim:
