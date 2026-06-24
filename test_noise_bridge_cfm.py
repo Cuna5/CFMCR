@@ -69,6 +69,12 @@ def build_loss(
     spatial_noise=False,
     noise_sigma_floor=0.08,
     cloud_mask_pred_loss_weight=0.0,
+    spatial_noise_source="mask",
+    gamma_delta_tau=0.5,
+    gamma_head_loss_weight=0.0,
+    gamma_mix_start_step=0,
+    gamma_mix_end_step=0,
+    gamma_mix_max_prob=0.0,
 ):
     return NoiseBridgeConsistencyFlowMatchingLoss(
         discretization_config=DISCRETIZATION_CONFIG,
@@ -84,6 +90,12 @@ def build_loss(
         noise_ramp_steps=noise_ramp_steps,
         spatial_noise=spatial_noise,
         noise_sigma_floor=noise_sigma_floor,
+        spatial_noise_source=spatial_noise_source,
+        gamma_delta_tau=gamma_delta_tau,
+        gamma_head_loss_weight=gamma_head_loss_weight,
+        gamma_mix_start_step=gamma_mix_start_step,
+        gamma_mix_end_step=gamma_mix_end_step,
+        gamma_mix_max_prob=gamma_mix_max_prob,
         cloud_mask_key="M",
         cloud_loss_weight=1.0,
         non_cloud_identity_loss_weight=0.0,
@@ -175,6 +187,30 @@ def test_spatial_noise_scale_from_mask():
         torch.full_like(scale[:, :, HEIGHT // 2 :], 0.02),
     )
     print("[OK] spatial training noise scale follows the soft cloud mask")
+
+
+def test_spatial_noise_scale_from_degradation():
+    loss_fn = build_loss(
+        noise_sigma=0.2,
+        spatial_noise=True,
+        noise_sigma_floor=0.1,
+        spatial_noise_source="degradation",
+        gamma_delta_tau=0.5,
+    )
+    clean = torch.zeros(BATCH, CHANNELS, HEIGHT, WIDTH)
+    cloudy = clean.clone()
+    cloudy[:, :, : HEIGHT // 2] = 0.5
+    scale = loss_fn._get_noise_scale({}, clean, noise_sigma=0.2, mu=cloudy)
+    assert scale.shape == (BATCH, 1, HEIGHT, WIDTH)
+    assert torch.allclose(
+        scale[:, :, : HEIGHT // 2],
+        torch.full_like(scale[:, :, : HEIGHT // 2], 0.2),
+    )
+    assert torch.allclose(
+        scale[:, :, HEIGHT // 2 :],
+        torch.full_like(scale[:, :, HEIGHT // 2 :], 0.02),
+    )
+    print("[OK] spatial training noise scale follows paired degradation")
 
 
 def test_oracle_sampler_and_reproducibility():
@@ -349,14 +385,57 @@ def test_spatial_loss_with_mask_head_backward():
     print(f"[OK] spatial noise + mask-head backward: {loss.item():.4f}")
 
 
+def test_gamma_head_backward_without_mask():
+    network = build_network(predict_cloud_mask=True)
+    denoiser = ResidualDenoiser(scaling_config=SCALING_CONFIG)
+    sigma2st = ConsistencyFlowMatchingSigma2St()
+    loss_fn = build_loss(
+        spatial_noise=True,
+        spatial_noise_source="degradation",
+        gamma_delta_tau=0.5,
+        noise_sigma_floor=0.1,
+        cloud_mask_pred_loss_weight=0.0,
+        gamma_head_loss_weight=0.1,
+        gamma_mix_start_step=0,
+        gamma_mix_end_step=0,
+        gamma_mix_max_prob=1.0,
+    )
+    clean = torch.randn(BATCH, CHANNELS, HEIGHT, WIDTH)
+    cloudy = torch.randn_like(clean)
+    cond = {"concat": cloudy}
+    batch = {"global_step": 100}
+
+    def teacher_fn(x, sigma, st, c, **extra):
+        del sigma, st, c, extra
+        return torch.zeros_like(x)
+
+    loss = loss_fn._forward(
+        network,
+        teacher_fn,
+        denoiser,
+        cond,
+        sigma2st,
+        clean,
+        cloudy,
+        batch,
+    ).mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    grad = network.diffusion_model.mask_out.proj.weight.grad
+    assert grad is not None and grad.abs().sum() > 0
+    print(f"[OK] gamma-head degradation P0 backward: {loss.item():.4f}")
+
+
 if __name__ == "__main__":
     test_shared_noise_bridge_points()
     test_zero_noise_degenerates_to_cfm_path()
     test_noise_ramp()
     test_spatial_noise_scale_from_mask()
+    test_spatial_noise_scale_from_degradation()
     test_oracle_sampler_and_reproducibility()
     test_zero_noise_sampler_matches_cfm()
     test_spatial_sampler_predicts_noise_scale()
     test_loss_forward_backward()
     test_spatial_loss_with_mask_head_backward()
+    test_gamma_head_backward_without_mask()
     print("all noise-bridge CFM smoke tests passed")
