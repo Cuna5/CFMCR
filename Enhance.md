@@ -431,7 +431,7 @@ sampler_config:
 
 
 
-## V3.2版本说明
+## V3.3版本说明
 
 P0 已落地到 noise-bridge CFM，并根据 `enhance/P0调整.md` 做了第二轮修正。核心目标是避免外部云概率或推理期 mask 漏云导致云区噪声过低。现在 P0 不再把“预测云不云”作为噪声尺度的唯一依据，而是训练时用 paired degradation 构造真值 `gamma_train`，推理时让轻量 gamma-head 回归这个尺度。
 
