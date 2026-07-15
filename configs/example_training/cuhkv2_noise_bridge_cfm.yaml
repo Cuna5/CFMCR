@@ -87,10 +87,19 @@ model:
         gamma_delta_tau: 0.5      # scan from the train-set |cloudy-clean| q90/q95
         gamma_delta_reduction: "rms"
         gamma_smooth_kernel: 0
-        gamma_head_loss_weight: 0.1
-        gamma_mix_start_step: 320000
-        gamma_mix_end_step: 400000
-        gamma_mix_max_prob: 0.5
+        # Step 2: head over-predicts gamma on clear sky (diag: clear/hat
+        # mean 0.028 vs clear/train 0.016). Push the head harder; its loss
+        # magnitude is tiny (~0.02) vs the endpoint loss, so 0.5-1.0 stays safe
+        # if 0.3 is not enough.
+        gamma_head_loss_weight: 0.3
+        # Step 1: Stage-C mixing was DEAD — old start=320000 is far beyond the
+        # real horizon, so the network never saw gamma_hat -> train/inference
+        # gap (晴空 32.54 oracle -> 25.28 real). Values below assume ~80000
+        # total steps (CUHK-CR2 ~1280 imgs, bs4, 2 GPU, 500 ep). CONFIRM your
+        # real train count / last global_step and rescale proportionally.
+        gamma_mix_start_step: 24000
+        gamma_mix_end_step: 52000
+        gamma_mix_max_prob: 0.7
         noise_ramp_steps: 0
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
@@ -139,7 +148,11 @@ model:
         lr_start: 0.01
         lr_max: 1.0
         lr_min: 0.01
-        max_decay_steps: 400000
+        # Was 400000 but the real run is far shorter, so cosine decay never
+        # completed (LR stayed high to the end, blunting fine detail + the
+        # small-signal gamma head). Match the real horizon (~80000; rescale
+        # after confirming train size) so LR reaches the settling phase.
+        max_decay_steps: 80000
 
     to_rgb_config:
       target: sgm.util.nir_to_rgb

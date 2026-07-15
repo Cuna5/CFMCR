@@ -1,0 +1,46 @@
+# CUHK-CR2 gamma-head calibration pilot overlay (10k steps).
+#
+# Load this AFTER cuhkv2_noise_bridge_cfm.yaml and pass the warm-start
+# checkpoint through a dotlist override:
+#
+#   python main.py \
+#     --base configs/example_training/cuhkv2_noise_bridge_cfm.yaml \
+#            configs/example_training/cuhkv2_gamma_calibration_pilot.yaml \
+#     --enable_tf32 true --no-test true \
+#     model.params.ckpt_path=/path/to/current_checkpoint.ckpt
+#
+# Use model.params.ckpt_path rather than -r/--resume.  The pilot intentionally
+# resets global_step so the shortened gamma-mixing and LR schedules run over
+# exactly 10k new optimization steps.
+
+model:
+  # Conservative full-model fine-tuning LR. The gamma head is emphasized by
+  # its loss weight instead of raising the shared optimizer LR.
+  base_learning_rate: 1.0e-5
+  params:
+    ckpt_path: null
+
+    loss_fn_config:
+      params:
+        gamma_head_loss_weight: 0.3
+        gamma_mix_start_step: 0
+        gamma_mix_end_step: 5000
+        gamma_mix_max_prob: 0.7
+
+    scheduler_config:
+      params:
+        warm_up_steps: 500
+        max_decay_steps: 10000
+
+lightning:
+  callbacks:
+    metrics_over_trainsteps_checkpoint:
+      params:
+        # Keeps exact 2k / 5k / 10k checkpoints available for diagnosis.
+        # The callback is weights-only but stores ten checkpoints; check disk
+        # capacity before launching the pilot.
+        every_n_train_steps: 1000
+
+  trainer:
+    max_steps: 10000
+    check_val_every_n_epoch: 1
