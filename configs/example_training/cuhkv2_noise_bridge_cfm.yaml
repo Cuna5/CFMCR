@@ -16,6 +16,9 @@ model:
     compile_model: false
     use_flash_attn2: false
     image_metrics: "evaluator"
+    # FID runs a separate InceptionV3 feature extractor during test/predict.
+    # Keep it off for training/validation; set true only for final FID runs.
+    enable_fid: false
     teacher_ema_decay: 0.9999
     count_sample_time: true
     count_train_time: true
@@ -91,7 +94,7 @@ model:
         # mean 0.028 vs clear/train 0.016). Push the head harder; its loss
         # magnitude is tiny (~0.02) vs the endpoint loss, so 0.5-1.0 stays safe
         # if 0.3 is not enough.
-        gamma_head_loss_weight: 0.3
+        gamma_head_loss_weight: 0.5
         # Step 1: Stage-C mixing was DEAD — old start=320000 is far beyond the
         # real horizon, so the network never saw gamma_hat -> train/inference
         # gap (晴空 32.54 oracle -> 25.28 real). Values below assume ~80000
@@ -99,7 +102,17 @@ model:
         # real train count / last global_step and rescale proportionally.
         gamma_mix_start_step: 24000
         gamma_mix_end_step: 52000
-        gamma_mix_max_prob: 0.7
+        gamma_mix_max_prob: 1.0
+        # V4.0: residual multi-domain supervision. LL is a small always-on
+        # structure anchor; Haar high bands and FFT use gamma_train from the
+        # paired degradation and start with the Stage-C curriculum. These are
+        # training-only and add no sampler/NFE cost.
+        residual_wavelet_ll_loss_weight: 0.02
+        residual_wavelet_hf_loss_weight: 0.01
+        residual_fft_loss_weight: 0.005
+        residual_detail_start_step: 24000
+        residual_detail_warmup_steps: 4000
+        residual_fft_channels: 3  # FFT on RGB only; Haar still covers RGB+NIR
         noise_ramp_steps: 0
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
@@ -114,7 +127,7 @@ model:
         cloud_weight_velocity_anchor: false
         non_cloud_identity_loss_weight: 0.05
         ssim_endpoint_loss_weight: 0.65
-        cloud_mask_pred_loss_weight: 0.0
+        cloud_mask_pred_loss_weight: 0.5
         num_steps: 40
         discretization_config:
           target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization

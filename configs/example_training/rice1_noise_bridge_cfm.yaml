@@ -91,6 +91,15 @@ model:
         gamma_mix_start_step: 80000
         gamma_mix_end_step: 100000
         gamma_mix_max_prob: 0.5
+        # V4.0 residual multi-domain supervision. RICE1 is RGB-only, so the
+        # FFT branch uses all three channels. Detail terms start together with
+        # this dataset's Stage-C gamma-mixing curriculum.
+        residual_wavelet_ll_loss_weight: 0.02
+        residual_wavelet_hf_loss_weight: 0.01
+        residual_fft_loss_weight: 0.005
+        residual_detail_start_step: 80000
+        residual_detail_warmup_steps: 4000
+        residual_fft_channels: 3
         noise_ramp_steps: 0
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3

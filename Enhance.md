@@ -431,6 +431,60 @@ sampler_config:
 
 
 
-## V3.5版本说明
+## V4.0版本说明
 
-添加实验检测代码，用于指标诊断
+FID诊断可调
+
+### Gamma 加权残差小波 / FFT Loss
+
+在 Noise-Bridge CFM 中新增训练期的残差多域监督。该功能只修改损失函数，
+不改变网络结构、采样器、一步恢复更新或推理 NFE；所有新增权重默认均为
+`0.0`，因此旧配置和旧 checkpoint 保持兼容。
+
+监督对象不是完整输出图，而是相对原始含云条件的恢复残差：
+
+\[
+r_{pred}=x_{endpoint}-x_{cloudy},\qquad
+r_{gt}=x_{clean}-x_{cloudy}.
+\]
+
+其中 `gamma_train` 直接由配对退化
+`|x_cloudy-x_clean|` 通过现有 `_get_degradation_prob()` 生成，并停止梯度。
+这里不能从 `train_noise_scale` 反推 gamma，因为后者还混合了
+`noise_sigma`、noise floor 和 noise ramp。
+
+新增三项损失：
+
+1. **Haar-LL 结构损失**：对 `r_pred` 和 `r_gt` 做一级正交 Haar 分解，
+   在 LL 子带施加重建损失，约束低频结构与整体辐射变化。
+2. **Gamma 加权 Haar-HF 损失**：将 `gamma_train` 平均池化到半分辨率，
+   作为 LH、HL、HH 三个高频子带的像素权重，使细节监督集中在真实退化区，
+   晴空区域仍主要由 endpoint、MS-SSIM 和 non-cloud identity 约束。
+3. **Gamma 加权 FFT 损失**：先用 `gamma_train` 对恢复残差加窗，再以
+   float32 执行 `rfft2(norm="ortho")`，比较复数频谱差。当前 CUHK-CR2
+   配置只对 RGB 三通道使用 FFT，Haar 仍覆盖 RGB+NIR，避免视觉频域约束
+   过度影响 NIR 光谱。
+
+当前 `cuhkv2_noise_bridge_cfm.yaml` 的保守初值为：
+
+```yaml
+residual_wavelet_ll_loss_weight: 0.02
+residual_wavelet_hf_loss_weight: 0.01
+residual_fft_loss_weight: 0.005
+residual_detail_start_step: 24000
+residual_detail_warmup_steps: 4000
+residual_fft_channels: 3
+```
+
+RICE1 和 RICE2 的 Noise-Bridge CFM 配置采用相同的三个损失权重与
+`residual_fft_channels: 3`；为匹配各自训练时长，细节项分别从 step 80000
+和 step 120000 启动，warmup 均为 4000 step。
+
+LL 结构项从训练开始生效；在 CUHK-CR2 配置中，Haar-HF 与 FFT 细节项
+从 step 24000 后线性启动，到 step 28000 达到完整权重，与当前 Stage-C
+gamma mixing 的启动阶段对齐，
+降低早期 endpoint 与残差细节表征尚未稳定时产生伪高频纹理的风险。
+这两项始终使用停止梯度的 `gamma_train`，不依赖 `gamma_hat` 或 gamma-head。
+建议消融顺序为：
+baseline → `+LL/HF` → `+LL/HF/FFT`，并分别检查重云区、云边界、晴空区
+以及 RGB/NIR/SAM 指标。

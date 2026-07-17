@@ -75,6 +75,12 @@ def build_loss(
     gamma_mix_start_step=0,
     gamma_mix_end_step=0,
     gamma_mix_max_prob=0.0,
+    residual_wavelet_ll_loss_weight=0.0,
+    residual_wavelet_hf_loss_weight=0.0,
+    residual_fft_loss_weight=0.0,
+    residual_detail_start_step=0,
+    residual_detail_warmup_steps=0,
+    residual_fft_channels=0,
 ):
     return NoiseBridgeConsistencyFlowMatchingLoss(
         discretization_config=DISCRETIZATION_CONFIG,
@@ -96,6 +102,12 @@ def build_loss(
         gamma_mix_start_step=gamma_mix_start_step,
         gamma_mix_end_step=gamma_mix_end_step,
         gamma_mix_max_prob=gamma_mix_max_prob,
+        residual_wavelet_ll_loss_weight=residual_wavelet_ll_loss_weight,
+        residual_wavelet_hf_loss_weight=residual_wavelet_hf_loss_weight,
+        residual_fft_loss_weight=residual_fft_loss_weight,
+        residual_detail_start_step=residual_detail_start_step,
+        residual_detail_warmup_steps=residual_detail_warmup_steps,
+        residual_fft_channels=residual_fft_channels,
         cloud_mask_key="M",
         cloud_loss_weight=1.0,
         non_cloud_identity_loss_weight=0.0,
@@ -213,6 +225,80 @@ def test_spatial_noise_scale_from_degradation():
     print("[OK] spatial training noise scale follows paired degradation")
 
 
+def test_residual_haar_bands_and_gamma_weighting():
+    loss_fn = build_loss(
+        residual_wavelet_ll_loss_weight=1.0,
+        residual_wavelet_hf_loss_weight=1.0,
+    )
+
+    # Replicate padding keeps a constant odd-sized image free of high bands.
+    constant = torch.ones(1, 1, 5, 7)
+    _, lh, hl, hh = loss_fn._haar2d(constant)
+    assert torch.count_nonzero(lh) == 0
+    assert torch.count_nonzero(hl) == 0
+    assert torch.count_nonzero(hh) == 0
+
+    checker = torch.tensor([[1.0, -1.0], [-1.0, 1.0]])
+    checker = checker.repeat(3, 4)[None, None]
+    cloudy = torch.zeros_like(checker)
+    clean = checker
+    endpoint = torch.zeros_like(checker)
+    gamma_on = torch.ones(1, 1, *checker.shape[-2:])
+    gamma_off = torch.zeros_like(gamma_on)
+    _, high_on, _ = loss_fn._residual_multidomain_losses(
+        endpoint, clean, cloudy, gamma_on
+    )
+    _, high_off, _ = loss_fn._residual_multidomain_losses(
+        endpoint, clean, cloudy, gamma_off
+    )
+    assert high_on.item() > 0.0
+    assert high_off.item() == 0.0
+    print("[OK] Haar high bands are weighted only by paired gamma")
+
+
+def test_residual_fft_loss_and_gradient():
+    loss_fn = build_loss(
+        residual_wavelet_hf_loss_weight=1.0,
+        residual_fft_loss_weight=1.0,
+        residual_fft_channels=2,
+    )
+    cloudy = torch.zeros(1, 3, 7, 9)
+    clean = torch.randn_like(cloudy)
+    endpoint = torch.zeros_like(cloudy, requires_grad=True)
+    gamma_on = torch.ones(1, 1, 7, 9)
+    gamma_off = torch.zeros_like(gamma_on)
+
+    _, _, fft_on = loss_fn._residual_multidomain_losses(
+        endpoint, clean, cloudy, gamma_on
+    )
+    _, _, fft_off = loss_fn._residual_multidomain_losses(
+        endpoint, clean, cloudy, gamma_off
+    )
+    _, _, fft_exact = loss_fn._residual_multidomain_losses(
+        clean, clean, cloudy, gamma_on
+    )
+    assert torch.isfinite(fft_on).all() and fft_on.item() > 0.0
+    assert abs(fft_off.item()) < 1e-7
+    assert abs(fft_exact.item()) < 1e-7
+    fft_on.mean().backward()
+    assert endpoint.grad is not None and torch.isfinite(endpoint.grad).all()
+    assert endpoint.grad.abs().sum() > 0
+    print("[OK] gamma-windowed complex FFT loss is finite and differentiable")
+
+
+def test_residual_detail_ramp():
+    loss_fn = build_loss(
+        residual_wavelet_hf_loss_weight=1.0,
+        residual_detail_start_step=10,
+        residual_detail_warmup_steps=20,
+    )
+    assert loss_fn._residual_detail_ramp({"global_step": 9}) == 0.0
+    assert loss_fn._residual_detail_ramp({"global_step": 10}) == 0.0
+    assert loss_fn._residual_detail_ramp({"global_step": 20}) == 0.5
+    assert loss_fn._residual_detail_ramp({"global_step": 30}) == 1.0
+    print("[OK] residual detail supervision follows its delayed warmup")
+
+
 def test_oracle_sampler_and_reproducibility():
     cloudy = torch.randn(BATCH, CHANNELS, HEIGHT, WIDTH)
     clean = torch.randn_like(cloudy)
@@ -322,6 +408,12 @@ def test_loss_forward_backward():
     denoiser = ResidualDenoiser(scaling_config=SCALING_CONFIG)
     sigma2st = ConsistencyFlowMatchingSigma2St()
     loss_fn = build_loss()
+
+    def unexpected_multidomain_call(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("zero residual weights must skip multi-domain loss")
+
+    loss_fn._residual_multidomain_losses = unexpected_multidomain_call
     clean = torch.randn(BATCH, CHANNELS, HEIGHT, WIDTH)
     cloudy = torch.randn_like(clean)
     cond = {"concat": cloudy}
@@ -345,6 +437,47 @@ def test_loss_forward_backward():
     assert torch.isfinite(loss)
     assert network.diffusion_model.patch_in.proj.weight.grad is not None
     print(f"[OK] noise-bridge CFM forward/backward: {loss.item():.4f}")
+
+
+def test_residual_multidomain_loss_forward_backward():
+    network = build_network()
+    denoiser = ResidualDenoiser(scaling_config=SCALING_CONFIG)
+    sigma2st = ConsistencyFlowMatchingSigma2St()
+    loss_fn = build_loss(
+        spatial_noise=True,
+        spatial_noise_source="degradation",
+        residual_wavelet_ll_loss_weight=0.02,
+        residual_wavelet_hf_loss_weight=0.01,
+        residual_fft_loss_weight=0.005,
+        residual_detail_start_step=0,
+        residual_detail_warmup_steps=0,
+        residual_fft_channels=3,
+    )
+    clean = torch.randn(BATCH, CHANNELS, HEIGHT, WIDTH)
+    cloudy = torch.randn_like(clean)
+    cond = {"concat": cloudy}
+    batch = {"global_step": 100}
+
+    def teacher_fn(x, sigma, st, c, **extra):
+        del sigma, st, c, extra
+        return torch.zeros_like(x)
+
+    loss = loss_fn._forward(
+        network,
+        teacher_fn,
+        denoiser,
+        cond,
+        sigma2st,
+        clean,
+        cloudy,
+        batch,
+    ).mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    grad = network.diffusion_model.patch_in.proj.weight.grad
+    assert grad is not None and torch.isfinite(grad).all()
+    assert grad.abs().sum() > 0
+    print(f"[OK] residual Haar/FFT forward/backward: {loss.item():.4f}")
 
 
 def test_spatial_loss_with_mask_head_backward():
@@ -432,10 +565,14 @@ if __name__ == "__main__":
     test_noise_ramp()
     test_spatial_noise_scale_from_mask()
     test_spatial_noise_scale_from_degradation()
+    test_residual_haar_bands_and_gamma_weighting()
+    test_residual_fft_loss_and_gradient()
+    test_residual_detail_ramp()
     test_oracle_sampler_and_reproducibility()
     test_zero_noise_sampler_matches_cfm()
     test_spatial_sampler_predicts_noise_scale()
     test_loss_forward_backward()
+    test_residual_multidomain_loss_forward_backward()
     test_spatial_loss_with_mask_head_backward()
     test_gamma_head_backward_without_mask()
     print("all noise-bridge CFM smoke tests passed")
