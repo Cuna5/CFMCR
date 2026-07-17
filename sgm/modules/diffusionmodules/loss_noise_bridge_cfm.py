@@ -355,9 +355,18 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         reference: torch.Tensor,
         noise_sigma: float,
     ) -> torch.Tensor:
+        prob = self._gamma_prob_from_logits(logits, reference)
+        return self._noise_scale_from_prob(prob, noise_sigma)
+
+    def _gamma_prob_from_logits(
+        self,
+        logits: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
         if logits is None:
             raise RuntimeError(
-                "gamma_head_loss_weight or gamma mixing requires "
+                "gamma-head supervision, gamma mixing, or adaptive skip "
+                "fusion requires "
                 "network_config.params.predict_cloud_mask=true so the "
                 "shared gamma head exposes last_mask_logits."
             )
@@ -384,7 +393,7 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
                 mode="bilinear",
                 align_corners=False,
             )
-        return self._noise_scale_from_prob(prob.clamp(0.0, 1.0), noise_sigma)
+        return prob.clamp(0.0, 1.0)
 
     def _gamma_mix_probability(self, batch: Dict) -> float:
         if self.gamma_mix_max_prob <= 0.0:
@@ -484,6 +493,9 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         mask_head_enabled = bool(
             getattr(diffusion_model, "predict_cloud_mask", False)
         )
+        adaptive_skip_enabled = bool(
+            getattr(diffusion_model, "adaptive_skip_fusion", False)
+        )
         head_loss_weight = (
             self.cloud_mask_pred_loss_weight + self.gamma_head_loss_weight
         )
@@ -497,6 +509,10 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             raise ValueError(
                 "cloud_mask_pred_loss_weight or gamma_head_loss_weight requires "
                 "predict_cloud_mask=true."
+            )
+        if adaptive_skip_enabled and not mask_head_enabled:
+            raise ValueError(
+                "adaptive_skip_fusion=true requires predict_cloud_mask=true."
             )
 
         sigmas = self.discretization(self.num_steps, device=device)
@@ -535,31 +551,39 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         noise_scale = train_noise_scale
         mix_prob = self._gamma_mix_probability(batch)
         gamma_head_logits = None
+        pred_gamma = None
         pred_noise_scale = None
         if (
             self.gamma_head_loss_weight > 0.0
+            or adaptive_skip_enabled
             or (
                 self.spatial_noise
                 and self.spatial_noise_source == "degradation"
                 and mix_prob > 0.0
             )
         ):
-            if self.gamma_head_loss_weight > 0.0:
+            if self.gamma_head_loss_weight > 0.0 or adaptive_skip_enabled:
                 sigma_max = float(getattr(self.discretization, "sigma_max", 1.0))
                 gamma_sigma = mu.new_full((mu.shape[0],), sigma_max)
                 gamma_st = sigma2st(gamma_sigma)
-                _ = denoiser(
-                    network,
-                    mu,
-                    gamma_sigma,
-                    cond,
-                    gamma_st,
-                    **additional_model_inputs,
-                )
+                prepass_inputs = dict(additional_model_inputs)
+                prepass_inputs.pop("skip_gamma", None)
+                with torch.set_grad_enabled(self.gamma_head_loss_weight > 0.0):
+                    _ = denoiser(
+                        network,
+                        mu,
+                        gamma_sigma,
+                        cond,
+                        gamma_st,
+                        **prepass_inputs,
+                    )
                 gamma_head_logits = self._get_head_logits(diffusion_model)
-                pred_noise_scale = self._noise_scale_from_logits(
+                pred_gamma = self._gamma_prob_from_logits(
                     gamma_head_logits,
                     input,
+                )
+                pred_noise_scale = self._noise_scale_from_prob(
+                    pred_gamma,
                     current_noise_sigma,
                 )
             else:
@@ -573,13 +597,51 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
                     current_noise_sigma,
                     additional_model_inputs,
                 )
-            if mix_prob > 0.0:
+            if mix_prob > 0.0 and not adaptive_skip_enabled:
                 noise_scale = self._mix_with_predicted_noise_scale(
                     train_noise_scale,
                     pred_noise_scale.detach(),
                     batch,
                     input,
                 )
+
+        main_model_inputs = dict(additional_model_inputs)
+        if adaptive_skip_enabled:
+            gamma_train_for_skip = self._get_degradation_prob(input, mu).detach()
+            skip_gamma = gamma_train_for_skip
+            if mix_prob > 0.0:
+                if pred_gamma is None or pred_noise_scale is None:
+                    raise RuntimeError(
+                        "adaptive skip Stage-C mixing requires a gamma-head "
+                        "prepass."
+                    )
+                use_predicted = torch.rand(
+                    batch_size,
+                    1,
+                    1,
+                    1,
+                    device=device,
+                ) < mix_prob
+                skip_gamma = torch.where(
+                    use_predicted,
+                    pred_gamma.detach(),
+                    gamma_train_for_skip,
+                )
+                if (
+                    self.spatial_noise
+                    and self.spatial_noise_source == "degradation"
+                ):
+                    if not torch.is_tensor(train_noise_scale):
+                        train_noise_scale = input.new_full(
+                            (batch_size, 1, 1, 1),
+                            float(train_noise_scale),
+                        )
+                    noise_scale = torch.where(
+                        use_predicted,
+                        pred_noise_scale.detach(),
+                        train_noise_scale,
+                    )
+            main_model_inputs["skip_gamma"] = skip_gamma.detach()
         _, x_current, x_next, velocity_target = self._build_bridge_points(
             input,
             mu,
@@ -594,7 +656,7 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             sigma_next,
             st_next,
             cond,
-            **additional_model_inputs,
+            **main_model_inputs,
         )
         velocity_student = denoiser(
             network,
@@ -602,7 +664,7 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             sigma_current,
             cond,
             st_current,
-            **additional_model_inputs,
+            **main_model_inputs,
         )
 
         sigma_current_bc = append_dims(sigma_current, input.ndim)

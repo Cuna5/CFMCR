@@ -431,60 +431,67 @@ sampler_config:
 
 
 
-## V4.0版本说明
+## V4.1版本说明
 
-FID诊断可调
+### Gamma/time 自适应 skip fusion
 
-### Gamma 加权残差小波 / FFT Loss
-
-在 Noise-Bridge CFM 中新增训练期的残差多域监督。该功能只修改损失函数，
-不改变网络结构、采样器、一步恢复更新或推理 NFE；所有新增权重默认均为
-`0.0`，因此旧配置和旧 checkpoint 保持兼容。
-
-监督对象不是完整输出图，而是相对原始含云条件的恢复残差：
+V4.1 将 HDiT 解码端原来每层只有一个全局标量的 `TokenSplit` 融合，改为“原标量基线 + Gamma/time 空间残差门控”。原始融合保持为：
 
 \[
-r_{pred}=x_{endpoint}-x_{cloudy},\qquad
-r_{gt}=x_{clean}-x_{cloudy}.
+F_{base}=\operatorname{lerp}(F_{skip},F_{dec},a),
 \]
 
-其中 `gamma_train` 直接由配对退化
-`|x_cloudy-x_clean|` 通过现有 `_get_degradation_prob()` 生成，并停止梯度。
-这里不能从 `train_noise_scale` 反推 gamma，因为后者还混合了
-`noise_sigma`、noise floor 和 noise ramp。
+新增项为：
 
-新增三项损失：
+\[
+F=F_{base}+\Delta a(\gamma_i,t)\odot(F_{dec}-F_{skip}),
+\]
 
-1. **Haar-LL 结构损失**：对 `r_pred` 和 `r_gt` 做一级正交 Haar 分解，
-   在 LL 子带施加重建损失，约束低频结构与整体辐射变化。
-2. **Gamma 加权 Haar-HF 损失**：将 `gamma_train` 平均池化到半分辨率，
-   作为 LH、HL、HH 三个高频子带的像素权重，使细节监督集中在真实退化区，
-   晴空区域仍主要由 endpoint、MS-SSIM 和 non-cloud identity 约束。
-3. **Gamma 加权 FFT 损失**：先用 `gamma_train` 对恢复残差加窗，再以
-   float32 执行 `rfft2(norm="ortho")`，比较复数频谱差。当前 CUHK-CR2
-   配置只对 RGB 三通道使用 FFT，Haar 仍覆盖 RGB+NIR，避免视觉频域约束
-   过度影响 NIR 光谱。
+\[
+\Delta a=\Delta_{max}\tanh\left(W_2\,\operatorname{SiLU}
+\left(W_1[\gamma_i,t]\right)\right).
+\]
 
-当前 `cuhkv2_noise_bridge_cfm.yaml` 的保守初值为：
+其中，`gamma_i` 是缩放到当前 decoder 尺度的软退化概率，`t` 由网络已有的 CFM 时间编码 `c_noise=0.25*log(t)` 恢复，`Δmax` 默认是 `0.25`。这样每个位置都能根据云退化强度和当前流时间，在 encoder 的观测细节与 decoder 的恢复结果之间自适应选择，而不是整幅图共用一个固定比例。
+
+#### 稳定性与旧模型兼容
+
+- 原 `fac`、投影和 `torch.lerp` 路径完整保留，没有改成 sigmoid、clamp 或重新参数化。
+- 门控最后一层 `W2` 的权重和偏置均为零初始化，因此刚启用时 `Δa=0`，输出与原模型完全一致；从旧 checkpoint warm-start 时只新增门控参数。
+- `skip_gamma` 在门控内部强制 `detach`，防止 gamma head 通过主动缩小退化概率来投机降低主任务损失。
+- 功能默认关闭；只有设置 `adaptive_skip_fusion: true` 才创建新参数，因此其他配置的 state dict 和原前向路径不变。
+- 旧权重可按项目当前的非严格权重加载方式 warm-start；但从旧训练任务完整恢复 optimizer state 可能因新增参数而不兼容，建议只加载模型权重后重新建立优化器。
+
+#### 训练数据流
+
+1. Gamma 预判前向不传 `skip_gamma`，严格使用原始 `fac` 融合，避免形成“gamma 决定 gate、gate 又反过来决定同一次 gamma”的循环。
+2. 正式 student/EMA teacher 前向共享同一张 detached gamma 图，但各自使用自己的 `t_current` / `t_next`，因此时间门控仍与一致性训练点对齐。
+3. Stage-C 之前使用配对样本计算的 `gamma_train`；Stage-C 开始后，skip gate 与 spatial noise bridge 共用同一个逐样本 Bernoulli 选择掩码，同时切换到 `gamma_hat`。这保证同一个样本的加噪强度和 skip 融合不会使用两个不同来源的 gamma。
+4. 主 student 前向结束后的 mask logits 仍用于原有 cloud-mask BCE；预判前向保存的 logits 继续用于 gamma-head loss，两条监督不会互相覆盖。
+
+#### 推理数据流与开销
+
+推理先对 cloudy input 做一次不带自适应 gate 的 gamma 预判，再将 `gamma_hat` 传入正式一步恢复。当前 CUHK-CR2、RICE1、RICE2 都已经启用 `spatial_noise`，原本就需要这次 gamma 预判，因此 V4.1 不增加网络前向次数，只增加各 decoder skip 上很小的两层逐像素 MLP。若在 `spatial_noise: false` 的其他配置中单独开启本功能，则会由一次前向变为“gamma 预判 + 正式恢复”两次前向。
+
+TTA 会在每个几何变换内部重新预测对应坐标系的 gamma；CFG 情况下 gamma 会同步扩展到 guided batch。当前实现仍限定在 `num_steps: 1` 的 noise-bridge 采样路径。
+
+#### 配置
+
+已在以下三个配置中启用：
+
+- `configs/example_training/cuhkv2_noise_bridge_cfm.yaml`
+- `configs/example_training/rice1_noise_bridge_cfm.yaml`
+- `configs/example_training/rice2_noise_bridge_cfm.yaml`
+
+统一参数为：
 
 ```yaml
-residual_wavelet_ll_loss_weight: 0.02
-residual_wavelet_hf_loss_weight: 0.01
-residual_fft_loss_weight: 0.005
-residual_detail_start_step: 24000
-residual_detail_warmup_steps: 4000
-residual_fft_channels: 3
+network_config:
+  params:
+    predict_cloud_mask: true
+    adaptive_skip_fusion: true
+    adaptive_skip_hidden_channels: 16
+    adaptive_skip_max_delta: 0.25
 ```
 
-RICE1 和 RICE2 的 Noise-Bridge CFM 配置采用相同的三个损失权重与
-`residual_fft_channels: 3`；为匹配各自训练时长，细节项分别从 step 80000
-和 step 120000 启动，warmup 均为 4000 step。
-
-LL 结构项从训练开始生效；在 CUHK-CR2 配置中，Haar-HF 与 FFT 细节项
-从 step 24000 后线性启动，到 step 28000 达到完整权重，与当前 Stage-C
-gamma mixing 的启动阶段对齐，
-降低早期 endpoint 与残差细节表征尚未稳定时产生伪高频纹理的风险。
-这两项始终使用停止梯度的 `gamma_train`，不依赖 `gamma_hat` 或 gamma-head。
-建议消融顺序为：
-baseline → `+LL/HF` → `+LL/HF/FFT`，并分别检查重云区、云边界、晴空区
-以及 RGB/NIR/SAM 指标。
+其中 `predict_cloud_mask: true` 是必要条件。消融实验只需把 `adaptive_skip_fusion` 改为 `false`；建议先固定其他 V4.0 loss 和 Stage-C 参数，对比整体、重云区、晴空区及云边界带的 PSNR/SSIM/RMSE，判断收益来自厚云恢复还是边界/晴空保持。

@@ -54,6 +54,10 @@ model:
         aux_global_mode: "tmm"
         aux_tmm_gate_hidden_channels: 32
         predict_cloud_mask: true
+        # V4.1: gamma/time-conditioned, zero-init TokenSplit correction.
+        adaptive_skip_fusion: true
+        adaptive_skip_hidden_channels: 16
+        adaptive_skip_max_delta: 0.25
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner

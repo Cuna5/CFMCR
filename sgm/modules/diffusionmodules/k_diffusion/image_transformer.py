@@ -749,6 +749,104 @@ class TokenSplit(nn.Module):
         x = rearrange(x, "... h w (nh nw e) -> ... (h nh) (w nw) e", nh=self.h, nw=self.w)
         return torch.lerp(skip.to(x.dtype), x, self.fac.to(x.dtype))
 
+
+class GammaTimeAdaptiveTokenSplit(TokenSplit):
+    """Warm-start-safe spatial skip fusion conditioned on gamma and CFM time."""
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        patch_size=(2, 2),
+        hidden_channels=16,
+        max_delta=0.25,
+    ):
+        super().__init__(in_features, out_features, patch_size)
+        if hidden_channels <= 0:
+            raise ValueError("adaptive skip hidden_channels must be positive")
+        if max_delta < 0.0:
+            raise ValueError("adaptive skip max_delta must be non-negative")
+        self.gate_in = apply_wd(Linear(2, hidden_channels))
+        self.gate_out = apply_wd(zero_init(Linear(hidden_channels, 1)))
+        self.max_delta = float(max_delta)
+
+    @staticmethod
+    def _resize_gamma(skip_gamma, x):
+        if skip_gamma.ndim != 4:
+            raise ValueError(
+                "skip_gamma must be BCHW, got shape "
+                f"{tuple(skip_gamma.shape)}"
+            )
+        if skip_gamma.shape[0] != x.shape[0]:
+            raise ValueError(
+                "skip_gamma batch size does not match skip features: "
+                f"{skip_gamma.shape[0]} vs {x.shape[0]}"
+            )
+        if skip_gamma.shape[1] != 1:
+            skip_gamma = skip_gamma.max(dim=1, keepdim=True).values
+        target_size = x.shape[-3:-1]
+        if skip_gamma.shape[-2:] != target_size:
+            if (
+                skip_gamma.shape[-2] >= target_size[0]
+                and skip_gamma.shape[-1] >= target_size[1]
+            ):
+                skip_gamma = F.adaptive_avg_pool2d(skip_gamma, target_size)
+            else:
+                skip_gamma = F.interpolate(
+                    skip_gamma,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        return skip_gamma.clamp(0.0, 1.0).movedim(1, -1)
+
+    @staticmethod
+    def _effective_time(timesteps, x):
+        if timesteps.ndim == 0:
+            timesteps = timesteps.expand(x.shape[0])
+        elif timesteps.ndim != 1:
+            timesteps = timesteps.reshape(timesteps.shape[0], -1).mean(dim=1)
+        if timesteps.shape[0] != x.shape[0]:
+            raise ValueError(
+                "timesteps batch size does not match skip features: "
+                f"{timesteps.shape[0]} vs {x.shape[0]}"
+            )
+        # ConsistencyFlowMatchingScaling supplies c_noise = 0.25 * log(t).
+        # Recover the bounded physical interpolation time used by the bridge.
+        time = torch.exp((4.0 * timesteps.float()).clamp(max=0.0))
+        return time.to(device=x.device, dtype=x.dtype).view(-1, 1, 1, 1)
+
+    def forward(self, x, skip, skip_gamma=None, timesteps=None):
+        x = self.proj(x)
+        x = rearrange(
+            x,
+            "... h w (nh nw e) -> ... (h nh) (w nw) e",
+            nh=self.h,
+            nw=self.w,
+        )
+        skip = skip.to(x.dtype)
+        base = torch.lerp(skip, x, self.fac.to(x.dtype))
+        if skip_gamma is None or timesteps is None or self.max_delta == 0.0:
+            return base
+
+        gamma = self._resize_gamma(
+            skip_gamma.detach().to(device=x.device, dtype=x.dtype),
+            x,
+        )
+        time = self._effective_time(timesteps, x).expand(
+            -1,
+            x.shape[-3],
+            x.shape[-2],
+            -1,
+        )
+        gate_features = torch.cat((gamma, time), dim=-1)
+        delta = self.max_delta * torch.tanh(
+            self.gate_out(F.silu(self.gate_in(gate_features)))
+        )
+        # gate_out is zero-initialized, so this is exactly the original lerp
+        # for a newly enabled module or a checkpoint warm-start.
+        return base + delta.to(x.dtype) * (x - skip)
+
 class TokenSplitWithControl(nn.Module):
     def __init__(self, in_features, out_features, patch_size=(2, 2)):
         super().__init__()
@@ -1192,6 +1290,9 @@ class ImageTransformerDenoiserModel(nn.Module):
         aux_tmm_gate_hidden_channels=32,
         predict_cloud_mask=False,
         use_dual_time=False,
+        adaptive_skip_fusion=False,
+        adaptive_skip_hidden_channels=16,
+        adaptive_skip_max_delta=0.25,
     ):
         super(ImageTransformerDenoiserModel, self).__init__()
         assert control_mode in ['sum', 'conv', 'lerp', None], "control_mode must be in ['sum','conv','lerp',None]"
@@ -1256,7 +1357,27 @@ class ImageTransformerDenoiserModel(nn.Module):
                 self.control_lerps.append(TokenSplitWithControl(spec.width, spec.width))
 
         self.merges = nn.ModuleList([TokenMerge(spec_1.width, spec_2.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
-        self.splits = nn.ModuleList([TokenSplit(spec_2.width, spec_1.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
+        self.adaptive_skip_fusion = bool(adaptive_skip_fusion)
+        if self.adaptive_skip_fusion and not predict_cloud_mask:
+            raise ValueError(
+                "adaptive_skip_fusion=true requires predict_cloud_mask=true "
+                "so inference can estimate skip_gamma from the cloudy input."
+            )
+        if self.adaptive_skip_fusion:
+            self.splits = nn.ModuleList([
+                GammaTimeAdaptiveTokenSplit(
+                    spec_2.width,
+                    spec_1.width,
+                    hidden_channels=adaptive_skip_hidden_channels,
+                    max_delta=adaptive_skip_max_delta,
+                )
+                for spec_1, spec_2 in zip(levels[:-1], levels[1:])
+            ])
+        else:
+            self.splits = nn.ModuleList([
+                TokenSplit(spec_2.width, spec_1.width)
+                for spec_1, spec_2 in zip(levels[:-1], levels[1:])
+            ])
 
         self.out_norm = RMSNorm(levels[0].width)
         self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
@@ -1285,7 +1406,15 @@ class ImageTransformerDenoiserModel(nn.Module):
         ]
         return groups
 
-    def forward(self, x, timesteps, control = None, aux_cond=None, timesteps_r=None):
+    def forward(
+        self,
+        x,
+        timesteps,
+        control=None,
+        aux_cond=None,
+        timesteps_r=None,
+        skip_gamma=None,
+    ):
         # Patching
         if control is not None:
             assert isinstance(control, list), "control must be a list!"
@@ -1335,7 +1464,10 @@ class ImageTransformerDenoiserModel(nn.Module):
         x = self.mid_level(x, pos, cond)
         
         for i, (up_level, split, skip, pos) in enumerate(reversed(list(zip(self.up_levels, self.splits, skips, poses)))):
-            x = split(x, skip)
+            if self.adaptive_skip_fusion:
+                x = split(x, skip, skip_gamma=skip_gamma, timesteps=c_noise)
+            else:
+                x = split(x, skip)
             if self.control_mode == "sum":
                 index = len(control) - i - 2
                 x = x + control[index]
@@ -1521,6 +1653,9 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
         aux_tmm_gate_hidden_channels=32,
         predict_cloud_mask=False,
         use_dual_time=False,
+        adaptive_skip_fusion=False,
+        adaptive_skip_hidden_channels=16,
+        adaptive_skip_max_delta=0.25,
     ):
         assert len(widths) == len(depths)
         assert len(widths) == len(d_ffs)
@@ -1542,20 +1677,23 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
                 levels.append(LevelSpec(depth, width, d_ff, self_attn, dropout))
         mapping = MappingSpec(mapping_depth, mapping_width, mapping_d_ff, mapping_dropout_rate)
         super().__init__(
-            in_channels,
-            out_channels,
-            patch_size,
-            levels,
-            mapping,
-            tanh,
-            control_mode,
-            use_aux_cond,
-            aux_channels,
-            aux_hidden_channels,
-            aux_global_mode,
-            aux_tmm_gate_hidden_channels,
-            predict_cloud_mask,
-            use_dual_time,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            patch_size=patch_size,
+            levels=levels,
+            mapping=mapping,
+            tanh=tanh,
+            control_mode=control_mode,
+            use_aux_cond=use_aux_cond,
+            aux_channels=aux_channels,
+            aux_hidden_channels=aux_hidden_channels,
+            aux_global_mode=aux_global_mode,
+            aux_tmm_gate_hidden_channels=aux_tmm_gate_hidden_channels,
+            predict_cloud_mask=predict_cloud_mask,
+            use_dual_time=use_dual_time,
+            adaptive_skip_fusion=adaptive_skip_fusion,
+            adaptive_skip_hidden_channels=adaptive_skip_hidden_channels,
+            adaptive_skip_max_delta=adaptive_skip_max_delta,
         )
 
 class ImageTemporalTransformerDenoiserInterface(ImageTemporalTransformerDenoiserModel):
