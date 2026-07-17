@@ -15,6 +15,12 @@ When ``spatial_noise_source="degradation"``, the training scale is computed
 from the paired degradation magnitude ``|x_cloudy - x_clean|`` and the shared
 one-channel head is supervised to predict that gamma scale for inference. This
 avoids using label-derived cloud masks at sampling time.
+
+Optional residual-domain supervision uses the same paired degradation gamma:
+the Haar LL band preserves coarse structure, gamma-weighted Haar high bands
+focus detail learning on degraded regions, and a small gamma-windowed complex
+FFT loss aligns the residual spectrum. These terms are training-only and do
+not change the sampler or inference cost.
 """
 
 from typing import Dict
@@ -30,7 +36,15 @@ from .sigma2st import Sigma2St
 
 
 class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
-    """CFM loss on a noisy-cloudy to clean straight path."""
+    """CFM loss on a noisy-cloudy to clean straight path.
+
+    ``residual_wavelet_ll_loss_weight`` supervises the low-pass Haar band of
+    ``endpoint - cloudy``. ``residual_wavelet_hf_loss_weight`` supervises the
+    three high-pass bands with the paired-degradation gamma as a spatial
+    weight. ``residual_fft_loss_weight`` compares the complex spectra of
+    gamma-windowed residuals. All three default to zero for backward
+    compatibility; the detail terms can be delayed and linearly warmed up.
+    """
 
     def __init__(
         self,
@@ -47,6 +61,12 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         gamma_mix_start_step: int = 0,
         gamma_mix_end_step: int = 0,
         gamma_mix_max_prob: float = 0.0,
+        residual_wavelet_ll_loss_weight: float = 0.0,
+        residual_wavelet_hf_loss_weight: float = 0.0,
+        residual_fft_loss_weight: float = 0.0,
+        residual_detail_start_step: int = 0,
+        residual_detail_warmup_steps: int = 0,
+        residual_fft_channels: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -66,6 +86,19 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             raise ValueError(
                 "gamma_delta_reduction must be 'rms', 'mean_abs', or 'l2'"
             )
+        frequency_weights = (
+            residual_wavelet_ll_loss_weight,
+            residual_wavelet_hf_loss_weight,
+            residual_fft_loss_weight,
+        )
+        if any(weight < 0.0 for weight in frequency_weights):
+            raise ValueError("residual wavelet/FFT loss weights must be non-negative")
+        if residual_detail_start_step < 0:
+            raise ValueError("residual_detail_start_step must be non-negative")
+        if residual_detail_warmup_steps < 0:
+            raise ValueError("residual_detail_warmup_steps must be non-negative")
+        if residual_fft_channels < 0:
+            raise ValueError("residual_fft_channels must be non-negative")
         self.noise_sigma = float(noise_sigma)
         self.noise_ramp_steps = int(noise_ramp_steps)
         self.spatial_noise = bool(spatial_noise)
@@ -78,6 +111,16 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
         self.gamma_mix_start_step = max(int(gamma_mix_start_step), 0)
         self.gamma_mix_end_step = max(int(gamma_mix_end_step), 0)
         self.gamma_mix_max_prob = min(max(float(gamma_mix_max_prob), 0.0), 1.0)
+        self.residual_wavelet_ll_loss_weight = float(
+            residual_wavelet_ll_loss_weight
+        )
+        self.residual_wavelet_hf_loss_weight = float(
+            residual_wavelet_hf_loss_weight
+        )
+        self.residual_fft_loss_weight = float(residual_fft_loss_weight)
+        self.residual_detail_start_step = int(residual_detail_start_step)
+        self.residual_detail_warmup_steps = int(residual_detail_warmup_steps)
+        self.residual_fft_channels = int(residual_fft_channels)
 
     def noise_sigma_at(self, global_step) -> float:
         if self.noise_ramp_steps == 0:
@@ -148,6 +191,132 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
                 padding=k_size // 2,
             )
         return prob.to(dtype=x_clean.dtype)
+
+    def _residual_detail_ramp(self, batch: Dict) -> float:
+        """Return the delayed linear ramp for Haar-HF and FFT terms."""
+        step = int(batch.get("global_step", 0))
+        if step < self.residual_detail_start_step:
+            return 0.0
+        if self.residual_detail_warmup_steps == 0:
+            return 1.0
+        progress = (
+            step - self.residual_detail_start_step
+        ) / float(self.residual_detail_warmup_steps)
+        return min(max(progress, 0.0), 1.0)
+
+    @staticmethod
+    def _haar2d(x: torch.Tensor):
+        """One-level orthonormal 2-D Haar transform for BCHW tensors.
+
+        Odd spatial dimensions are padded by replicating the last row/column,
+        keeping the loss usable for arbitrary training crops.
+        """
+        pad_h = x.shape[-2] % 2
+        pad_w = x.shape[-1] % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
+        x00 = x[..., 0::2, 0::2]
+        x01 = x[..., 0::2, 1::2]
+        x10 = x[..., 1::2, 0::2]
+        x11 = x[..., 1::2, 1::2]
+        ll = 0.5 * (x00 + x01 + x10 + x11)
+        lh = 0.5 * (-x00 - x01 + x10 + x11)
+        hl = 0.5 * (-x00 + x01 - x10 + x11)
+        hh = 0.5 * (x00 - x01 - x10 + x11)
+        return ll, lh, hl, hh
+
+    def _residual_multidomain_losses(
+        self,
+        endpoint: torch.Tensor,
+        x_clean: torch.Tensor,
+        x_cloudy: torch.Tensor,
+        gamma_train=None,
+        include_detail: bool = True,
+    ):
+        """Return per-sample Haar-LL, gamma-HF and gamma-FFT losses.
+
+        The supervised signal is the restoration residual rather than the
+        complete image, so already-clear content remains governed by the
+        existing endpoint and identity terms.
+        """
+        batch_size = endpoint.shape[0]
+        zero = endpoint.new_zeros(batch_size)
+        residual_pred = endpoint - x_cloudy
+        residual_target = x_clean - x_cloudy
+
+        wavelet_ll_loss = zero
+        wavelet_hf_loss = zero
+        if (
+            self.residual_wavelet_ll_loss_weight > 0.0
+            or self.residual_wavelet_hf_loss_weight > 0.0
+        ):
+            pred_bands = self._haar2d(residual_pred)
+            target_bands = self._haar2d(residual_target)
+            if self.residual_wavelet_ll_loss_weight > 0.0:
+                wavelet_ll_loss = self._get_loss(
+                    pred_bands[0], target_bands[0]
+                )
+            if (
+                include_detail
+                and self.residual_wavelet_hf_loss_weight > 0.0
+            ):
+                if gamma_train is None:
+                    raise ValueError("gamma_train is required for Haar-HF loss")
+                pad_h = gamma_train.shape[-2] % 2
+                pad_w = gamma_train.shape[-1] % 2
+                gamma_for_haar = gamma_train
+                if pad_h or pad_w:
+                    gamma_for_haar = F.pad(
+                        gamma_for_haar,
+                        (0, pad_w, 0, pad_h),
+                        mode="replicate",
+                    )
+                gamma_half = F.avg_pool2d(
+                    gamma_for_haar.float(), kernel_size=2, stride=2
+                ).to(dtype=endpoint.dtype)
+                pred_high = torch.cat(pred_bands[1:], dim=1)
+                target_high = torch.cat(target_bands[1:], dim=1)
+                wavelet_hf_loss = self._get_loss(
+                    pred_high,
+                    target_high,
+                    pixel_weight=gamma_half,
+                )
+
+        fft_loss = zero
+        if include_detail and self.residual_fft_loss_weight > 0.0:
+            if gamma_train is None:
+                raise ValueError("gamma_train is required for FFT loss")
+            channels = residual_pred.shape[1]
+            if self.residual_fft_channels > 0:
+                channels = min(self.residual_fft_channels, channels)
+            gamma_float = gamma_train.float()
+            weighted_error = (
+                residual_pred[:, :channels].float()
+                - residual_target[:, :channels].float()
+            ) * gamma_float
+            spectral_error = torch.fft.rfft2(
+                weighted_error,
+                norm="ortho",
+            )
+            spectral_error = spectral_error.abs()
+            if self.loss_type == "l2":
+                spectral_loss = spectral_error.square()
+            elif self.loss_type == "l1":
+                spectral_loss = spectral_error
+            elif self.loss_type == "charbonnier":
+                eps = spectral_error.new_tensor(self.charbonnier_eps)
+                # Subtracting eps makes an exact spectral match contribute 0
+                # instead of a constant that cannot affect the gradients.
+                spectral_loss = (
+                    torch.sqrt(spectral_error.square() + eps.square()) - eps
+                )
+            else:
+                raise NotImplementedError(f"Unknown loss_type: {self.loss_type}")
+            fft_loss = spectral_loss.reshape(batch_size, -1).mean(dim=1)
+            fft_loss = fft_loss.to(dtype=endpoint.dtype)
+
+        return wavelet_ll_loss, wavelet_hf_loss, fft_loss
 
     def _get_noise_scale(
         self,
@@ -464,6 +633,37 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             cloud_weight,
         )
 
+        residual_detail_ramp = self._residual_detail_ramp(batch)
+        residual_ll_enabled = self.residual_wavelet_ll_loss_weight > 0.0
+        residual_detail_enabled = residual_detail_ramp > 0.0 and (
+            self.residual_wavelet_hf_loss_weight > 0.0
+            or self.residual_fft_loss_weight > 0.0
+        )
+        if residual_ll_enabled or residual_detail_enabled:
+            # Use the paired-degradation gamma directly. Do not recover it
+            # from train_noise_scale: that value also contains noise_sigma,
+            # the ramp and the non-zero noise floor.
+            gamma_train = (
+                self._get_degradation_prob(input, mu).detach()
+                if residual_detail_enabled
+                else None
+            )
+            (
+                residual_wavelet_ll_loss,
+                residual_wavelet_hf_loss,
+                residual_fft_loss,
+            ) = self._residual_multidomain_losses(
+                endpoint_student,
+                input,
+                mu,
+                gamma_train,
+                include_detail=residual_detail_enabled,
+            )
+        else:
+            residual_wavelet_ll_loss = endpoint_student.new_zeros(batch_size)
+            residual_wavelet_hf_loss = endpoint_student.new_zeros(batch_size)
+            residual_fft_loss = endpoint_student.new_zeros(batch_size)
+
         if self.ssim_endpoint_loss_weight > 0.0:
             ssim_loss = self._ms_ssim_loss(endpoint_student, input)
         else:
@@ -530,6 +730,13 @@ class NoiseBridgeConsistencyFlowMatchingLoss(ConsistencyFlowMatchingLoss):
             + self.velocity_anchor_loss_weight * velocity_anchor_loss
             + self.clean_endpoint_loss_weight * clean_endpoint_loss
             + self.ssim_endpoint_loss_weight * ssim_loss
+            + self.residual_wavelet_ll_loss_weight * residual_wavelet_ll_loss
+            + residual_detail_ramp
+            * self.residual_wavelet_hf_loss_weight
+            * residual_wavelet_hf_loss
+            + residual_detail_ramp
+            * self.residual_fft_loss_weight
+            * residual_fft_loss
             + self.non_cloud_identity_loss_weight * identity_loss
             + self.cloud_mask_pred_loss_weight * mask_pred_loss
             + self.gamma_head_loss_weight * gamma_head_loss
