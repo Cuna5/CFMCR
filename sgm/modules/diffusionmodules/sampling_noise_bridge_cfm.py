@@ -79,13 +79,15 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
     def _get_last_mask_prob(self, mu):
         if self._network_ref is None:
             raise RuntimeError(
-                "spatial_noise=true requires sampler.set_network_ref(model)."
+                "spatial noise or adaptive skip fusion requires "
+                "sampler.set_network_ref(model)."
             )
         net = getattr(self._network_ref, "diffusion_model", self._network_ref)
         logits = getattr(net, "last_mask_logits", None)
         if logits is None:
             raise RuntimeError(
-                "spatial_noise=true requires network_config.params."
+                "spatial noise or adaptive skip fusion requires "
+                "network_config.params."
                 "predict_cloud_mask=true so the shared gamma head can "
                 "produce last_mask_logits."
             )
@@ -117,17 +119,29 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
         floor = self.noise_sigma_floor
         return self.noise_sigma * (floor + (1.0 - floor) * mask)
 
+    def _adaptive_skip_enabled(self):
+        if self._network_ref is None:
+            return False
+        net = getattr(self._network_ref, "diffusion_model", self._network_ref)
+        return bool(getattr(net, "adaptive_skip_fusion", False))
+
+    def _predict_gamma_prob(self, denoiser, mu, sigma, cond, st, uc):
+        # Deliberately omit skip_gamma: the predictor must use the original
+        # scalar skip fusion, otherwise gamma would condition its own estimate.
+        _ = self._denoise(mu, denoiser, sigma, cond, st, uc)
+        return self._get_last_mask_prob(mu).detach()
+
     def _predict_noise_scale(self, denoiser, mu, sigma, cond, st, uc):
         if not self.spatial_noise:
             return None
-        _ = self._denoise(mu, denoiser, sigma, cond, st, uc)
-        return self._noise_scale_from_mask(self._get_last_mask_prob(mu))
+        gamma = self._predict_gamma_prob(denoiser, mu, sigma, cond, st, uc)
+        return self._noise_scale_from_mask(gamma)
 
     def _prepare_loop(self, x_randn, mu, cond, uc, num_steps):
-        if self.spatial_noise:
+        if self.spatial_noise or self._adaptive_skip_enabled():
             raise NotImplementedError(
-                "Noise-bridge spatial_noise currently supports the one-step "
-                "sampler path. Set sampler.num_steps=1."
+                "Noise-bridge spatial noise and adaptive skip fusion currently "
+                "support the one-step sampler path. Set sampler.num_steps=1."
             )
         sigmas = self.discretization(
             self.num_steps if num_steps is None else num_steps,
@@ -177,17 +191,36 @@ class NoiseBridgeConsistencyFlowMatchingSampler(
         s_in = mu.new_ones([mu.shape[0]])
         sigma = s_in * sigma_max
         st = self.sigma2st(sigma)
-        noise_scale = self._predict_noise_scale(
-            denoiser,
-            mu,
-            sigma,
-            cond,
-            st,
-            uc,
+        adaptive_skip_enabled = self._adaptive_skip_enabled()
+        gamma = None
+        if self.spatial_noise or adaptive_skip_enabled:
+            gamma = self._predict_gamma_prob(
+                denoiser,
+                mu,
+                sigma,
+                cond,
+                st,
+                uc,
+            )
+        noise_scale = (
+            self._noise_scale_from_mask(gamma)
+            if self.spatial_noise
+            else None
         )
         x_init = self._noise_start(x, mu, noise_scale)
 
-        velocity = self._denoise(x_init, denoiser, sigma, cond, st, uc)
+        if adaptive_skip_enabled:
+            velocity = self._denoise(
+                x_init,
+                denoiser,
+                sigma,
+                cond,
+                st,
+                uc,
+                skip_gamma=gamma,
+            )
+        else:
+            velocity = self._denoise(x_init, denoiser, sigma, cond, st, uc)
         x_clean = x_init + append_dims(sigma, x_init.ndim) * velocity
         x_clean = self._finalize(x_clean, mu)
 

@@ -151,8 +151,26 @@ class ConsistencyFlowMatchingSampler:
             gen = tqdm(gen, total=num_sigmas, desc=f"CFM Sampling ({num_sigmas - 1} steps)")
         return gen
 
-    def _denoise(self, x, denoiser, sigma, cond, st, uc):
-        velocity = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc), st=st)
+    def _denoise(self, x, denoiser, sigma, cond, st, uc, **extra):
+        prepared = self.guider.prepare_inputs(x, sigma, cond, uc)
+        model_batch = prepared[0].shape[0]
+        extra = dict(extra)
+        for key, value in extra.items():
+            if (
+                torch.is_tensor(value)
+                and value.ndim > 0
+                and value.shape[0] != model_batch
+            ):
+                if model_batch % value.shape[0] != 0:
+                    raise ValueError(
+                        f"{key} batch size {value.shape[0]} cannot be aligned "
+                        f"with guided model batch size {model_batch}."
+                    )
+                extra[key] = torch.cat(
+                    [value] * (model_batch // value.shape[0]),
+                    dim=0,
+                )
+        velocity = denoiser(*prepared, st=st, **extra)
         return self.guider(velocity, sigma)
 
     def _prepare_loop(self, x_randn, mu, cond, uc, num_steps):
