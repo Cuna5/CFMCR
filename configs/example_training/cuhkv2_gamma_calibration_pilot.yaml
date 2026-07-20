@@ -18,6 +18,8 @@ model:
   # its loss weight instead of raising the shared optimizer LR.
   base_learning_rate: 1.0e-5
   params:
+    # Keep the inherited FID evaluator off during this training overlay.
+    enable_fid: false
     ckpt_path: null
 
     loss_fn_config:

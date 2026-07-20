@@ -8,6 +8,8 @@ model:
     compile_model: False # whether to compile the model using torch.compile
     use_ema: True # whether to use EMA
     use_flash_attn2: False # whether to use flash attention 2
+    # Enable only for final test/predict runs; FID loads InceptionV3.
+    enable_fid: false
     # ckpt_path: "" # path to your checkpoint 
      
     sigma_st_config:
@@ -177,4 +179,3 @@ lightning:
     benchmark: True # whether to enable benchmark mode
     accumulate_grad_batches: 1 # accumulate gradients for 1 batch
     max_epochs: 1000 # maximum number of epochs
-    

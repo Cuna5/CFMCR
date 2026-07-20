@@ -8,6 +8,8 @@ model:
     compile_model: false
     use_flash_attn2: false
     image_metrics: "evaluator"
+    # Enable only for final test/predict runs; FID loads InceptionV3.
+    enable_fid: false
     teacher_ema_decay: 0.9999
     count_sample_time: true
     count_train_time: true
@@ -47,6 +49,10 @@ model:
         aux_global_mode: "tmm"
         aux_tmm_gate_hidden_channels: 32
         predict_cloud_mask: false
+        # V4.1 controls (disabled: base CFM has no gamma skip-gate path).
+        adaptive_skip_fusion: false
+        adaptive_skip_hidden_channels: 16
+        adaptive_skip_max_delta: 0.25
 
     conditioner_config:
       target: sgm.modules.GeneralConditioner

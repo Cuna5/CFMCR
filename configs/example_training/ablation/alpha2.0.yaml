@@ -8,6 +8,8 @@ model:
     compile_model: False
     use_ema: True
     use_flash_attn2: False
+    # Enable only for final test/predict runs; FID loads InceptionV3.
+    enable_fid: false
     # ckpt_path: "" # your checkpoint path
     
     sigma_st_config:
@@ -181,4 +183,3 @@ lightning:
     check_val_every_n_epoch: 5
     accumulate_grad_batches: 1
     max_epochs: 500
-    

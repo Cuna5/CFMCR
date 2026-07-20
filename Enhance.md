@@ -477,8 +477,9 @@ TTA 会在每个几何变换内部重新预测对应坐标系的 gamma；CFG 情
 
 #### 配置
 
-已在以下三个配置中启用：
+已在以下四个 Noise-Bridge CFM 配置中启用：
 
+- `configs/example_training/cuhk_noise_bridge_cfm.yaml`
 - `configs/example_training/cuhkv2_noise_bridge_cfm.yaml`
 - `configs/example_training/rice1_noise_bridge_cfm.yaml`
 - `configs/example_training/rice2_noise_bridge_cfm.yaml`
@@ -494,4 +495,11 @@ network_config:
     adaptive_skip_max_delta: 0.25
 ```
 
-其中 `predict_cloud_mask: true` 是必要条件。消融实验只需把 `adaptive_skip_fusion` 改为 `false`；建议先固定其他 V4.0 loss 和 Stage-C 参数，对比整体、重云区、晴空区及云边界带的 PSNR/SSIM/RMSE，判断收益来自厚云恢复还是边界/晴空保持。
+其中 `predict_cloud_mask: true` 是必要条件。所有使用单时相
+`ImageTransformerDenoiserModelInterface` 的配置都显式列出上述三个 V4.1
+参数；非 Noise-Bridge CFM 配置默认设为 `adaptive_skip_fusion: false`，
+避免在没有 gamma skip-gate 数据流时创建无效参数。多时相配置使用不支持该
+参数的 `ImageTemporalTransformerDenoiserInterface`，因此不添加这三项。
+消融实验只需把 `adaptive_skip_fusion` 改为 `false`；建议先固定其他 V4.0
+loss 和 Stage-C 参数，对比整体、重云区、晴空区及云边界带的
+PSNR/SSIM/RMSE，判断收益来自厚云恢复还是边界/晴空保持。
