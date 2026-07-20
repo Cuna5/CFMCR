@@ -12,6 +12,8 @@ model:
     compile_model: false
     use_flash_attn2: false
     image_metrics: "evaluator"
+    # Enable only for final test/predict runs; FID loads InceptionV3.
+    enable_fid: false
     teacher_ema_decay: 0.9999
     count_sample_time: true
     count_train_time: true
