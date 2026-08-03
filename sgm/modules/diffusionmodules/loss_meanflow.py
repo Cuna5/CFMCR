@@ -58,8 +58,8 @@ Practical notes
   `use_dual_time=true` to receive the jump-target embedding `timesteps_r`.
 
 Engine compatibility: forward() keeps the ConsistencyFlowMatchingLoss
-signature (teacher_fn is accepted and ignored), so
-ConsistencyFlowMatchingEngine works unchanged.
+signature (teacher_fn is accepted and ignored). The dedicated
+``MeanFlowEngine`` passes ``None`` and avoids creating a redundant CFM teacher.
 """
 
 from typing import Dict
@@ -121,6 +121,8 @@ class MeanFlowLoss(ConsistencyFlowMatchingLoss):
     ):
         super().__init__(*args, **kwargs)
         assert jvp_mode in ("jvp", "fd"), f"unsupported jvp_mode: {jvp_mode}"
+        if fd_eps <= 0.0:
+            raise ValueError("fd_eps must be positive")
         p_sum = full_pair_prob + t1_pair_prob + equal_pair_prob
         assert 0.0 <= p_sum <= 1.0, "pair probabilities must sum to <= 1"
         self.meanflow_loss_weight = float(meanflow_loss_weight)
@@ -152,6 +154,45 @@ class MeanFlowLoss(ConsistencyFlowMatchingLoss):
         T = torch.where(full | t1, torch.ones_like(T), T)
         T = torch.where(eq, s, T)
         return s, T
+
+    def _finite_difference_du_ds(
+        self,
+        u_fn,
+        u,
+        x_s,
+        s,
+        T,
+        velocity,
+        cpu_rng_state,
+        cuda_rng_state,
+    ):
+        """Estimate the trajectory derivative without crossing the jump end.
+
+        Replaying the primary forward's RNG state keeps dropout masks identical
+        between ``u`` and the finite-difference probe. The per-sample step is
+        clipped to ``T - s``; equal-time pairs therefore have an exact zero
+        derivative contribution and no out-of-domain ``s > T`` evaluation.
+        """
+        gap = (T - s).clamp_min(0.0)
+        step = torch.minimum(gap, torch.full_like(gap, self.fd_eps))
+        active = step > 0.0
+        step_bc = append_dims(step, x_s.ndim)
+
+        devices = [x_s.device.index] if x_s.is_cuda else []
+        with torch.random.fork_rng(devices=devices):
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device=x_s.device)
+            with torch.no_grad():
+                u_shift = u_fn(x_s + step_bc * velocity, s + step, T)
+
+        denom = append_dims(
+            step.clamp_min(torch.finfo(step.dtype).eps),
+            x_s.ndim,
+        )
+        du_ds = (u_shift - u.detach()) / denom
+        active_bc = append_dims(active, x_s.ndim)
+        return torch.where(active_bc, du_ds, torch.zeros_like(du_ds))
 
     # ------------------------------------------------------------------
     # Loss
@@ -222,15 +263,30 @@ class MeanFlowLoss(ConsistencyFlowMatchingLoss):
             )
             mask_logits = getattr(diffusion_model, "last_mask_logits", None)
         else:
+            # Save the state before the primary forward so the FD probe can
+            # reuse the exact same dropout masks without rewinding the caller's
+            # RNG stream after it completes.
+            cpu_rng_state = torch.get_rng_state()
+            cuda_rng_state = (
+                torch.cuda.get_rng_state(input.device)
+                if input.is_cuda
+                else None
+            )
             u = u_fn(x_s, s, T)
             # Preserve logits from the grad-enabled primary forward. The
             # finite-difference probe below runs under no_grad and overwrites
             # diffusion_model.last_mask_logits.
             mask_logits = getattr(diffusion_model, "last_mask_logits", None)
-            eps = self.fd_eps
-            with torch.no_grad():
-                u_shift = u_fn(x_s + eps * v, s + eps, T)
-                du_ds = (u_shift - u.detach()) / eps
+            du_ds = self._finite_difference_du_ds(
+                u_fn,
+                u,
+                x_s,
+                s,
+                T,
+                v,
+                cpu_rng_state,
+                cuda_rng_state,
+            )
 
         gap_bc = append_dims(T - s, input.ndim)
         u_tgt = (v + gap_bc * du_ds).detach()

@@ -431,75 +431,36 @@ sampler_config:
 
 
 
-## V4.1版本说明
+## V4.2版本说明
 
-### Gamma/time 自适应 skip fusion
+V4.2 只补齐 MeanFlow 的 FD 稳定性、Gamma spatial-noise 和专属训练
+engine，不移植 Stage-C、adaptive skip fusion 或 Haar/FFT residual loss。
 
-V4.1 将 HDiT 解码端原来每层只有一个全局标量的 `TokenSplit` 融合，改为“原标量基线 + Gamma/time 空间残差门控”。原始融合保持为：
+### MeanFlow FD 稳定性
 
-\[
-F_{base}=\operatorname{lerp}(F_{skip},F_{dec},a),
-\]
+- 有限差分的第二次前向会回放主前向的 CPU/CUDA RNG 状态，保证
+  dropout mask 一致，并在探测结束后保持主前向之后的 RNG 状态。
+- 每个样本使用 `h=min(fd_eps, T-s)`；`T=s` 时导数修正严格为零，
+  不再越过 `s<=T` 的有效区间。`fd_eps<=0` 会直接报错。
 
-新增项为：
+### MeanFlow Gamma spatial-noise
 
-\[
-F=F_{base}+\Delta a(\gamma_i,t)\odot(F_{dec}-F_{skip}),
-\]
+- Noise-Bridge MeanFlow 训练时从成对的 cloudy/clean 差异构造
+  `gamma_train`，并使用
+  `noise_sigma * (floor + (1-floor) * gamma_train)` 调制逐像素起点噪声。
+- 共享单通道 head 在 MeanFlow 真实一步条件 `s=0, T=1` 上学习
+  gamma；推理时先做 gamma prepass，再用 `gamma_hat` 生成空间噪声尺度。
+- 推理支持 TTA 和 CFG 的 batch/坐标对齐。开启 spatial noise 时限定
+  `num_steps=1`，总共两次网络前向（gamma prepass + 一步恢复）。
+- `cuhk`、`cuhkv2`、`rice1`、`rice2` 四份
+  `*_noise_bridge_meanflow.yaml` 已开启该链路；`adaptive_skip_fusion`
+  保持关闭，配置中不加入 Stage-C 和 residual-domain 参数。
 
-\[
-\Delta a=\Delta_{max}\tanh\left(W_2\,\operatorname{SiLU}
-\left(W_1[\gamma_i,t]\right)\right).
-\]
+### 专属 MeanFlow engine
 
-其中，`gamma_i` 是缩放到当前 decoder 尺度的软退化概率，`t` 由网络已有的 CFM 时间编码 `c_noise=0.25*log(t)` 恢复，`Δmax` 默认是 `0.25`。这样每个位置都能根据云退化强度和当前流时间，在 encoder 的观测细节与 decoder 的恢复结果之间自适应选择，而不是整幅图共用一个固定比例。
-
-#### 稳定性与旧模型兼容
-
-- 原 `fac`、投影和 `torch.lerp` 路径完整保留，没有改成 sigmoid、clamp 或重新参数化。
-- 门控最后一层 `W2` 的权重和偏置均为零初始化，因此刚启用时 `Δa=0`，输出与原模型完全一致；从旧 checkpoint warm-start 时只新增门控参数。
-- `skip_gamma` 在门控内部强制 `detach`，防止 gamma head 通过主动缩小退化概率来投机降低主任务损失。
-- 功能默认关闭；只有设置 `adaptive_skip_fusion: true` 才创建新参数，因此其他配置的 state dict 和原前向路径不变。
-- 旧权重可按项目当前的非严格权重加载方式 warm-start；但从旧训练任务完整恢复 optimizer state 可能因新增参数而不兼容，建议只加载模型权重后重新建立优化器。
-
-#### 训练数据流
-
-1. Gamma 预判前向不传 `skip_gamma`，严格使用原始 `fac` 融合，避免形成“gamma 决定 gate、gate 又反过来决定同一次 gamma”的循环。
-2. 正式 student/EMA teacher 前向共享同一张 detached gamma 图，但各自使用自己的 `t_current` / `t_next`，因此时间门控仍与一致性训练点对齐。
-3. Stage-C 之前使用配对样本计算的 `gamma_train`；Stage-C 开始后，skip gate 与 spatial noise bridge 共用同一个逐样本 Bernoulli 选择掩码，同时切换到 `gamma_hat`。这保证同一个样本的加噪强度和 skip 融合不会使用两个不同来源的 gamma。
-4. 主 student 前向结束后的 mask logits 仍用于原有 cloud-mask BCE；预判前向保存的 logits 继续用于 gamma-head loss，两条监督不会互相覆盖。
-
-#### 推理数据流与开销
-
-推理先对 cloudy input 做一次不带自适应 gate 的 gamma 预判，再将 `gamma_hat` 传入正式一步恢复。当前 CUHK-CR2、RICE1、RICE2 都已经启用 `spatial_noise`，原本就需要这次 gamma 预判，因此 V4.1 不增加网络前向次数，只增加各 decoder skip 上很小的两层逐像素 MLP。若在 `spatial_noise: false` 的其他配置中单独开启本功能，则会由一次前向变为“gamma 预判 + 正式恢复”两次前向。
-
-TTA 会在每个几何变换内部重新预测对应坐标系的 gamma；CFG 情况下 gamma 会同步扩展到 guided batch。当前实现仍限定在 `num_steps: 1` 的 noise-bridge 采样路径。
-
-#### 配置
-
-已在以下四个 Noise-Bridge CFM 配置中启用：
-
-- `configs/example_training/cuhk_noise_bridge_cfm.yaml`
-- `configs/example_training/cuhkv2_noise_bridge_cfm.yaml`
-- `configs/example_training/rice1_noise_bridge_cfm.yaml`
-- `configs/example_training/rice2_noise_bridge_cfm.yaml`
-
-统一参数为：
-
-```yaml
-network_config:
-  params:
-    predict_cloud_mask: true
-    adaptive_skip_fusion: true
-    adaptive_skip_hidden_channels: 16
-    adaptive_skip_max_delta: 0.25
-```
-
-其中 `predict_cloud_mask: true` 是必要条件。所有使用单时相
-`ImageTransformerDenoiserModelInterface` 的配置都显式列出上述三个 V4.1
-参数；非 Noise-Bridge CFM 配置默认设为 `adaptive_skip_fusion: false`，
-避免在没有 gamma skip-gate 数据流时创建无效参数。多时相配置使用不支持该
-参数的 `ImageTemporalTransformerDenoiserInterface`，因此不添加这三项。
-消融实验只需把 `adaptive_skip_fusion` 改为 `false`；建议先固定其他 V4.0
-loss 和 Stage-C 参数，对比整体、重云区、晴空区及云边界带的
-PSNR/SSIM/RMSE，判断收益来自厚云恢复还是边界/晴空保持。
+- 普通 MeanFlow 改用 `sgm.models.diffusion_meanflow.MeanFlowEngine`，保留常规
+  model EMA、评估、日志和采样链路，不再创建或每步更新 CFM teacher。
+- 新 engine 可忽略旧 CFM-backed MeanFlow checkpoint 中的
+  `teacher_model.*` 权重，其余 student 和 model-EMA 键保持兼容。
+- Noise-Bridge MeanFlow 的 loss 本来就是 teacher-free 签名，因此继续使用
+  `ResidualDiffusionEngine`，不会引入 CFM teacher。

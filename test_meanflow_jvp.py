@@ -12,7 +12,9 @@ Checks:
      to the single-time CFM output, for any jump target T;
   4. MeanFlowLoss forward/backward: finite loss, gradients flow to backbone,
      dual-time branch and mask head;
-  5. MeanFlowSampler 1-step / multi-step output shapes + mask composition.
+  5. MeanFlowSampler 1-step / multi-step output shapes + mask composition;
+  6. the dedicated MeanFlow engine filters legacy teacher weights and passes
+     no teacher into the teacher-free loss.
 """
 import warnings
 
@@ -20,6 +22,7 @@ warnings.filterwarnings("ignore")
 
 import torch
 
+from sgm.models.diffusion_meanflow import MeanFlowEngine
 from sgm.modules.diffusionmodules.denoiser import ResidualDenoiser
 from sgm.modules.diffusionmodules.k_diffusion.image_transformer import (
     ImageTransformerDenoiserModelInterface,
@@ -156,6 +159,195 @@ def test_dual_time_warm_start():
     print("[OK] dual-time zero-init warm start (output independent of T at init)")
 
 
+def build_fd_loss():
+    return MeanFlowLoss(
+        discretization_config=DISCRETIZATION_CONFIG,
+        num_steps=2,
+        jvp_mode="fd",
+        fd_eps=1e-2,
+    )
+
+
+def test_fd_replays_dropout_rng():
+    loss_fn = build_fd_loss()
+    batch = 2
+    x_s = torch.ones(batch, 1, 4, 4)
+    velocity = torch.full_like(x_s, 0.25)
+    s = torch.tensor([0.2, 0.4])
+    T = torch.tensor([0.8, 0.9])
+    dropout = torch.nn.Dropout(p=0.5)
+    dropout.train()
+    masks = []
+
+    def u_fn(x_in, s_in, T_in):
+        del T_in
+        out = dropout(x_in)
+        masks.append((out != 0).detach().clone())
+        return out + 3.0 * s_in[:, None, None, None]
+
+    cpu_rng_state = torch.get_rng_state()
+    u = u_fn(x_s, s, T)
+    post_primary_rng_state = torch.get_rng_state()
+    du_ds = loss_fn._finite_difference_du_ds(
+        u_fn,
+        u,
+        x_s,
+        s,
+        T,
+        velocity,
+        cpu_rng_state,
+        None,
+    )
+
+    assert len(masks) == 2
+    assert torch.equal(masks[0], masks[1]), "FD probe changed the dropout mask"
+    assert torch.equal(
+        torch.get_rng_state(),
+        post_primary_rng_state,
+    ), "FD probe rewound or advanced the caller's CPU RNG stream"
+    expected = masks[0].to(velocity.dtype) * velocity / (1.0 - dropout.p) + 3.0
+    assert torch.allclose(du_ds, expected, atol=2e-5, rtol=2e-5)
+    print("[OK] finite difference replays the primary dropout RNG state")
+
+
+def test_fd_replays_cuda_dropout_rng():
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA dropout RNG replay (CUDA unavailable)")
+        return
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    loss_fn = build_fd_loss()
+    x_s = torch.ones(2, 1, 4, 4, device=device)
+    velocity = torch.full_like(x_s, 0.25)
+    s = torch.tensor([0.2, 0.4], device=device)
+    T = torch.tensor([0.8, 0.9], device=device)
+    dropout = torch.nn.Dropout(p=0.5).train()
+    masks = []
+
+    def u_fn(x_in, s_in, T_in):
+        del T_in
+        out = dropout(x_in)
+        masks.append((out != 0).detach().clone())
+        return out + 3.0 * s_in[:, None, None, None]
+
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state(device)
+    u = u_fn(x_s, s, T)
+    post_primary_cpu_state = torch.get_rng_state()
+    post_primary_cuda_state = torch.cuda.get_rng_state(device)
+    du_ds = loss_fn._finite_difference_du_ds(
+        u_fn,
+        u,
+        x_s,
+        s,
+        T,
+        velocity,
+        cpu_rng_state,
+        cuda_rng_state,
+    )
+
+    assert torch.equal(masks[0], masks[1]), "FD probe changed the CUDA dropout mask"
+    assert torch.equal(torch.get_rng_state(), post_primary_cpu_state)
+    assert torch.equal(torch.cuda.get_rng_state(device), post_primary_cuda_state)
+    expected = masks[0].to(velocity.dtype) * velocity / (1.0 - dropout.p) + 3.0
+    assert torch.allclose(du_ds, expected, atol=2e-5, rtol=2e-5)
+    print("[OK] finite difference replays CUDA dropout without changing caller RNG")
+
+
+def test_fd_requires_positive_step():
+    try:
+        MeanFlowLoss(
+            discretization_config=DISCRETIZATION_CONFIG,
+            num_steps=2,
+            jvp_mode="fd",
+            fd_eps=0.0,
+        )
+    except ValueError as exc:
+        assert "fd_eps must be positive" in str(exc)
+    else:
+        raise AssertionError("fd_eps=0 must be rejected")
+    print("[OK] finite difference requires a positive step")
+
+
+def test_fd_respects_jump_boundary():
+    loss_fn = build_fd_loss()
+    batch = 3
+    x_s = torch.randn(batch, 1, 4, 4)
+    velocity = torch.randn_like(x_s)
+    # Covers a normal pair, a gap smaller than fd_eps, and an equal-time pair.
+    s = torch.tensor([0.2, 0.995, 0.5])
+    T = torch.tensor([0.8, 1.0, 0.5])
+    calls = []
+
+    def u_fn(x_in, s_in, T_in):
+        calls.append((s_in.detach().clone(), T_in.detach().clone()))
+        return 2.0 * x_in + 3.0 * s_in[:, None, None, None]
+
+    cpu_rng_state = torch.get_rng_state()
+    u = u_fn(x_s, s, T)
+    du_ds = loss_fn._finite_difference_du_ds(
+        u_fn,
+        u,
+        x_s,
+        s,
+        T,
+        velocity,
+        cpu_rng_state,
+        None,
+    )
+
+    shifted_s, shifted_T = calls[-1]
+    assert torch.all(shifted_s <= shifted_T)
+    assert torch.all(shifted_s <= 1.0)
+    assert torch.allclose(shifted_s, torch.tensor([0.21, 1.0, 0.5]))
+    expected = 2.0 * velocity + 3.0
+    assert torch.allclose(du_ds[:2], expected[:2], atol=2e-4, rtol=2e-4)
+    assert torch.equal(du_ds[2], torch.zeros_like(du_ds[2]))
+    print("[OK] finite difference stays inside s <= T for small/equal gaps")
+
+
+def test_meanflow_engine_teacher_free_contract():
+    engine = MeanFlowEngine.__new__(MeanFlowEngine)
+    torch.nn.Module.__init__(engine)
+    engine.register_parameter("probe", torch.nn.Parameter(torch.zeros(1)))
+
+    legacy_state = engine.state_dict()
+    legacy_state["probe"] = torch.ones(1)
+    legacy_state["teacher_model.legacy_weight"] = torch.ones(1)
+    incompatible = engine.load_state_dict(
+        legacy_state,
+        strict=True,
+        assign=True,
+    )
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+    assert torch.equal(engine.probe, torch.ones_like(engine.probe))
+
+    captured = {}
+
+    class ProbeLoss:
+        def __call__(self, *args):
+            captured["args"] = args
+            return torch.tensor([1.0, 3.0])
+
+    engine.model = torch.nn.Identity()
+    engine.loss_fn = ProbeLoss()
+    engine.denoiser = object()
+    engine.conditioner = object()
+    engine.sigma2st = object()
+    x = torch.zeros(2, 1, 1, 1)
+    mu = torch.ones_like(x)
+    loss, loss_dict = engine.forward(x, mu, {"global_step": 0})
+
+    assert captured["args"][1] is None
+    assert captured["args"][-3] is x
+    assert captured["args"][-2] is mu
+    assert captured["args"][-1] == {"global_step": 0}
+    assert loss.item() == 2.0
+    assert loss_dict["loss"] is loss
+    print("[OK] dedicated MeanFlow engine is teacher-free and legacy-compatible")
+
+
 def run_loss(jvp_mode):
     attns = [
         {"type": "shifted-window", "d_head": 16, "window_size": 8},
@@ -253,6 +445,11 @@ if __name__ == "__main__":
               "server to decide jvp vs fd for the real config")
 
     test_dual_time_warm_start()
+    test_fd_replays_dropout_rng()
+    test_fd_replays_cuda_dropout_rng()
+    test_fd_requires_positive_step()
+    test_fd_respects_jump_boundary()
+    test_meanflow_engine_teacher_free_contract()
     run_loss("jvp")
     run_loss("fd")
     test_sampler()

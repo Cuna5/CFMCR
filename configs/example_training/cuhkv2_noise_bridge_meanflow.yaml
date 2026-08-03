@@ -1,8 +1,9 @@
 ##############################################################################
-# P1 Noise-Bridge MeanFlow — CUHK-CR2
+# Spatial-Gamma Noise-Bridge MeanFlow — CUHK-CR2
 #
 # CUHKV2 keeps the original CUHK-CR2 4-channel RGB+NIR setup, aux_mode "full",
-# and aux_global_mode "nce"; only the path changes to the noisy-cloudy bridge.
+# and aux_global_mode "nce". Paired degradation supervises the shared gamma
+# head used to spatially modulate bridge noise at training and inference.
 ##############################################################################
 
 model:
@@ -22,8 +23,8 @@ model:
     count_sample_time: true
     count_train_time: true
 
-    # P1 trains the fixed bridge directly. For P2 warm-starting, set
-    # base_learning_rate to 2.0e-5 and enable noise_ramp_steps.
+    # For warm-starting, set base_learning_rate to 2.0e-5 and optionally ramp
+    # noise_sigma with noise_ramp_steps.
     # ckpt_path: "/path/to/cuhkv2_meanflow.ckpt"
 
     sigma_st_config:
@@ -62,8 +63,9 @@ model:
         aux_global_mode: "nce"
         aux_tmm_gate_hidden_channels: 32
         use_dual_time: true
-        predict_cloud_mask: false
-        # V4.1 controls (disabled: MeanFlow has no gamma skip-gate path).
+        # Shared one-channel head predicts paired-degradation gamma.
+        predict_cloud_mask: true
+        # This minimal port intentionally excludes adaptive skip fusion.
         adaptive_skip_fusion: false
         adaptive_skip_hidden_channels: 16
         adaptive_skip_max_delta: 0.25
@@ -90,6 +92,13 @@ model:
       target: sgm.modules.diffusionmodules.loss_noise_bridge_meanflow.NoiseBridgeMeanFlowLoss
       params:
         noise_sigma: 0.10
+        spatial_noise: true
+        noise_sigma_floor: 0.08
+        spatial_noise_source: "degradation"
+        gamma_delta_tau: 0.5
+        gamma_delta_reduction: "rms"
+        gamma_smooth_kernel: 0
+        gamma_head_loss_weight: 0.5
         noise_ramp_steps: 0
         loss_type: "charbonnier"
         charbonnier_eps: 1.0e-3
@@ -122,6 +131,8 @@ model:
       target: sgm.modules.diffusionmodules.sampling_noise_bridge_meanflow.NoiseBridgeMeanFlowSampler
       params:
         noise_sigma: 0.10
+        spatial_noise: true
+        noise_sigma_floor: 0.08
         num_steps: 1
         tta: false
         clamp_output: true
