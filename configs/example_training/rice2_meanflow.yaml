@@ -1,6 +1,6 @@
 model:
   base_learning_rate: 1.0e-4
-  target: sgm.models.diffusion_cfm.ConsistencyFlowMatchingEngine
+  target: sgm.models.diffusion_meanflow.MeanFlowEngine
   params:
     input_key: "label"
     mean_key: "cond_image"
@@ -10,7 +10,8 @@ model:
     image_metrics: "evaluator"
     # Enable only for final test/predict runs; FID loads InceptionV3.
     enable_fid: false
-    teacher_ema_decay: 0.9999
+    use_ema: true
+    ema_decay_rate: 0.9999
     count_sample_time: true
     count_train_time: true
     sigma_st_config:
